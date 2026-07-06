@@ -20,6 +20,7 @@ data/output/
 # Dagster
 .dagster/
 dagster_home/
+tmp*/
 
 # OS / IDE
 .DS_Store
@@ -28,4 +29,5 @@ dagster_home/
 
 #conda
 .conda/
-command.sh
+command/
+
