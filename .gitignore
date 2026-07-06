@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Env / secrets
+.env
+
+# Data / artifacts
+mlflow.db
+mlflow/
+*.parquet
+data/raw/
+data/output/
+
+# Dagster
+.dagster/
+dagster_home/
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+
+#conda
+.conda/
+command.sh

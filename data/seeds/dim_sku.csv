@@ -1,0 +1,16 @@
+sku_id,name,category,unit_price,reorder_point
+SKU_00001,Amul Toned Milk 500ml,dairy,27.0,40
+SKU_00002,Britannia Brown Bread,bakery,45.0,25
+SKU_00003,Farm Eggs (6 pcs),dairy,54.0,30
+SKU_00004,Tata Salt 1kg,staples,28.0,20
+SKU_00005,Aashirvaad Atta 5kg,staples,255.0,15
+SKU_00006,Maggi Noodles 4-pack,snacks,56.0,50
+SKU_00007,Coca-Cola 750ml,beverages,40.0,45
+SKU_00008,Lay's Classic Salted,snacks,20.0,60
+SKU_00009,Banana (1 dozen),produce,50.0,35
+SKU_00010,Tomato 1kg,produce,32.0,30
+SKU_00011,Onion 1kg,produce,35.0,30
+SKU_00012,Amul Butter 100g,dairy,58.0,25
+SKU_00013,Parle-G Biscuits,snacks,10.0,70
+SKU_00014,Red Bull 250ml,beverages,125.0,20
+SKU_00015,Surf Excel 1kg,household,110.0,18
