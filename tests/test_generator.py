@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import math
 import time
-from datetime import UTC
+from datetime import timezone
 
 import pytest
 
@@ -202,7 +202,7 @@ class TestSchemas:
         from pydantic import ValidationError
         with pytest.raises(ValidationError):
             OrderEvent(
-                event_id="x", event_time=datetime.now(tz=UTC),
+                event_id="x", event_time=datetime.now(tz=timezone.utc),
                 store_id="DS_001", sku_id="SKU_001", category="dairy",
                 quantity=0, unit_price=27.0, order_id="o1",
             )

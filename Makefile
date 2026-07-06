@@ -1,4 +1,4 @@
-.PHONY: setup lint test up down seed logs
+.PHONY: setup lint test up down seed logs initdb topics flink-submit flink-logs
 
 setup:  ## Install package + dev deps
 	pip install -e ".[dev]"
@@ -20,3 +20,27 @@ down:  ## Stop the local stack
 
 logs:  ## Tail stack logs
 	docker-compose logs -f
+
+initdb:  ## Create Postgres tables (run once after `make up`)
+	docker-compose exec -T postgres psql -U veloshelf -d veloshelf \
+		-f /dev/stdin < infra/init_db.sql
+
+topics:  ## Create all Kafka topics (run once after `make up`)
+	docker-compose exec -T kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+		--create --if-not-exists --topic raw-orders      --partitions 3 --replication-factor 1
+	docker-compose exec -T kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+		--create --if-not-exists --topic raw-inventory   --partitions 3 --replication-factor 1
+	docker-compose exec -T kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+		--create --if-not-exists --topic dead-letter     --partitions 1 --replication-factor 1
+	docker-compose exec -T kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+		--create --if-not-exists --topic stockout-alerts --partitions 1 --replication-factor 1
+	docker-compose exec -T kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+		--create --if-not-exists --topic surge-alerts    --partitions 1 --replication-factor 1
+	@echo "All topics created."
+
+flink-submit:  ## Submit the PyFlink job to the Flink cluster (detached)
+	docker-compose exec -T flink-jobmanager \
+		bash -c "PYFLINK_PYTHON=python3 flink run -py /opt/veloshelf/streaming/job.py --detached"
+
+flink-logs:  ## List running Flink jobs via the REST API
+	docker-compose exec -T flink-jobmanager curl -s http://localhost:8081/jobs | python3 -m json.tool

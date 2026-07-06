@@ -16,7 +16,7 @@ import logging
 import os
 import time
 import uuid
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -68,7 +68,7 @@ def make_order_event(
 ) -> OrderEvent:
     return OrderEvent(
         event_id=str(uuid.uuid4()),
-        event_time=datetime.now(tz=UTC),
+        event_time=datetime.now(tz=timezone.utc),
         store_id=store_id,
         sku_id=sku_id,
         category=category,
@@ -88,7 +88,7 @@ def make_inventory_event(
 ) -> InventoryEvent:
     return InventoryEvent(
         event_id=str(uuid.uuid4()),
-        event_time=datetime.now(tz=UTC),
+        event_time=datetime.now(tz=timezone.utc),
         store_id=store_id,
         sku_id=sku_id,
         movement_type=MovementType.SALE,
@@ -136,7 +136,7 @@ def run(mode: str) -> None:
         )
 
         while True:
-            now = datetime.now(tz=UTC)
+            now = datetime.now(tz=timezone.utc)
 
             # --- Check for scheduled anomaly ---
             signal = injector.check()
@@ -194,10 +194,14 @@ def run(mode: str) -> None:
                 if events_sent % 100 == 0:
                     logger.info("Events sent: %d", events_sent)
 
-            # --- Sleep (realtime mode only) ---
+            # --- Sleep ---
             if mode == "realtime":
                 gap = next_inter_arrival(now)
                 time.sleep(gap)
+            else:
+                # fast: tiny sleep so real clock advances and event-time
+                # timestamps span >65 s — required for 1-min windows to fire
+                time.sleep(0.005)
 
 
 # ---------------------------------------------------------------------------

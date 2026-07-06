@@ -1,15 +1,21 @@
+# VeloShelf local stack (Phase 2).
+# Kafka (KRaft) + Postgres + MLflow + Dagster + Flink (jobmanager + taskmanager).
+# Redis kept in for reference; Postgres is the locked-in serving store.
+
 services:
   kafka:
     image: apache/kafka:3.8.0
     ports:
-      - "9092:9092"
+      - "9092:9092"    # host access
+      - "29092:29092"  # docker-internal access
     environment:
       KAFKA_NODE_ID: 0
       KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_LISTENERS: EXTERNAL://:9092,INTERNAL://:29092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: EXTERNAL://localhost:9092,INTERNAL://kafka:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: EXTERNAL:PLAINTEXT,INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
       KAFKA_CONTROLLER_QUORUM_VOTERS: 0@localhost:9093
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
@@ -40,6 +46,8 @@ services:
       - POSTGRES_USER=veloshelf
       - POSTGRES_PASSWORD=veloshelf
       - POSTGRES_DB=veloshelf
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U veloshelf"]
       interval: 10s
@@ -71,6 +79,58 @@ services:
                dagster dev -h 0.0.0.0 -p 3000 -f orchestration/definitions.py"
     depends_on:
       - kafka
+      - postgres
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: veloshelf
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+    depends_on:
+      - kafka
+
+  # -------------------------------------------------------------------
+  # Flink (added Phase 2)
+  # -------------------------------------------------------------------
+  flink-jobmanager:
+    build:
+      context: .
+      dockerfile: Dockerfile.flink
+    ports:
+      - "8081:8081"     # Flink web UI
+    command: jobmanager
+    environment:
+      - "FLINK_PROPERTIES=jobmanager.rpc.address: flink-jobmanager"
+      - PYTHONPATH=/opt/veloshelf
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+    volumes:
+      - ./streaming:/opt/veloshelf/streaming
+      - ./generator:/opt/veloshelf/generator
+      - ./data:/opt/veloshelf/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:8081/overview || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+
+  flink-taskmanager:
+    build:
+      context: .
+      dockerfile: Dockerfile.flink
+    command: taskmanager
+    environment:
+      - "FLINK_PROPERTIES=jobmanager.rpc.address: flink-jobmanager"
+      - PYTHONPATH=/opt/veloshelf
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+    volumes:
+      - ./streaming:/opt/veloshelf/streaming
+      - ./generator:/opt/veloshelf/generator
+      - ./data:/opt/veloshelf/data
+    depends_on:
+      - flink-jobmanager
 
 volumes:
   mlflow_data:
+  postgres_data:

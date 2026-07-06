@@ -4,12 +4,12 @@ import json
 import random
 import time
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
-from enum import StrEnum
+from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 
 
-class AnomalyType(StrEnum):
+class AnomalyType(str, Enum):
     SURGE = "surge"
     STOCKOUT_RISK = "stockout_risk"
 
@@ -92,7 +92,7 @@ class AnomalyInjector:
             anomaly_type=signal.anomaly_type,
             store_id=signal.store_id,
             sku_id=signal.sku_id,
-            injected_at=datetime.now(tz=UTC).isoformat(),
+            injected_at=datetime.now(tz=timezone.utc).isoformat(),
             surge_extra_events=signal.surge_extra_events,
             stockout_target_units=signal.stockout_target_units,
         )

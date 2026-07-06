@@ -1,0 +1,14 @@
+FROM flink:1.18-scala_2.12-java11
+
+RUN apt-get update -qq && \
+    apt-get install -y --no-install-recommends python3 python3-pip curl && \
+    ln -sf /usr/bin/python3 /usr/bin/python && \
+    curl -fL -o /opt/flink/lib/flink-sql-connector-kafka-3.1.0-1.18.jar \
+        "https://repo1.maven.org/maven2/org/apache/flink/flink-sql-connector-kafka/3.1.0-1.18/flink-sql-connector-kafka-3.1.0-1.18.jar" && \
+    pip3 install --no-cache-dir \
+        apache-flink==1.18.1 \
+        python-dotenv==1.0.1 \
+        psycopg2-binary==2.9.9 \
+        kafka-python==2.0.2 \
+        pydantic==2.7.1 && \
+    rm -rf /var/lib/apt/lists/*

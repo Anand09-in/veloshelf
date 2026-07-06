@@ -8,12 +8,12 @@ these shapes and quarantines anything that fails.
 from __future__ import annotations
 
 from datetime import datetime
-from enum import StrEnum
+from enum import Enum
 
 from pydantic import BaseModel, Field
 
 
-class MovementType(StrEnum):
+class MovementType(str, Enum):
     SALE = "sale"
     RESTOCK = "restock"
     ADJUSTMENT = "adjustment"
