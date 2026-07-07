@@ -28,9 +28,8 @@ class PostgresSink:
             (store_id, sku_id, window_start, window_end,
              order_rate, depletion_vel, demand_momentum, on_hand_est, updated_at)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (store_id, sku_id)
+        ON CONFLICT (store_id, sku_id, window_start)
         DO UPDATE SET
-            window_start    = EXCLUDED.window_start,
             window_end      = EXCLUDED.window_end,
             order_rate      = EXCLUDED.order_rate,
             depletion_vel   = EXCLUDED.depletion_vel,

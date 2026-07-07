@@ -1,4 +1,4 @@
-.PHONY: setup lint test up down seed logs initdb topics flink-submit flink-logs
+.PHONY: setup lint test up down seed logs initdb topics flink-submit flink-logs export-features train
 
 setup:  ## Install package + dev deps
 	pip install -e ".[dev]"
@@ -44,3 +44,13 @@ flink-submit:  ## Submit the PyFlink job to the Flink cluster (detached)
 
 flink-logs:  ## List running Flink jobs via the REST API
 	docker-compose exec -T flink-jobmanager curl -s http://localhost:8081/jobs | python3 -m json.tool
+
+export-features:  ## Dump windowed_features from Postgres → data/features/features.parquet
+	python -m ml.export_features
+
+train:  ## Export features then train the anomaly detector
+	python -m ml.export_features
+	python -m ml.train_detector
+
+forecast:
+	python -m ml.train_forecast

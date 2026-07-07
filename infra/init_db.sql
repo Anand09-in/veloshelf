@@ -5,10 +5,11 @@
 
 -- ---------------------------------------------------------------------------
 -- Windowed features
--- Latest feature snapshot per (store_id, sku_id).
--- Upserted by the Flink job on every 1-min tumbling window close.
+-- One row per (store_id, sku_id, window_start) — accumulates every window
+-- so the ML trainer has a full time-series per SKU.
 -- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS windowed_features (
+DROP TABLE IF EXISTS windowed_features CASCADE;
+CREATE TABLE windowed_features (
     store_id        TEXT        NOT NULL,
     sku_id          TEXT        NOT NULL,
     window_start    TIMESTAMPTZ NOT NULL,
@@ -18,7 +19,7 @@ CREATE TABLE IF NOT EXISTS windowed_features (
     demand_momentum FLOAT       NOT NULL DEFAULT 1,   -- short/long rate ratio
     on_hand_est     INT         NOT NULL DEFAULT 0,   -- estimated on-hand after window
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (store_id, sku_id)
+    PRIMARY KEY (store_id, sku_id, window_start)
 );
 
 -- ---------------------------------------------------------------------------
