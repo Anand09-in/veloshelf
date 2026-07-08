@@ -146,3 +146,25 @@ def forecaster_promotion(
     )
     context.log.info("Forecaster promotion: %s", "PROMOTED" if promoted else "SKIPPED")
     return {"promoted": promoted}
+
+
+# ---------------------------------------------------------------------------
+# Drift report asset (Phase 4)
+# ---------------------------------------------------------------------------
+ 
+@asset(
+    deps=[windowed_features_parquet],
+    description="Run Evidently drift detection (PSI+KS+JS) on rolling windows.",
+)
+def drift_report(context: AssetExecutionContext) -> dict:
+    from observability.drift_job import run_drift_job
+    result = run_drift_job()
+    if result.get("skipped"):
+        context.log.warning("Drift job skipped: %s", result.get("reason"))
+    else:
+        context.log.info(
+            "Drift job complete | any_drift=%s report=%s",
+            result["any_drift"], result["report_path"],
+        )
+    return result
+ 

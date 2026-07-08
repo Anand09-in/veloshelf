@@ -38,12 +38,18 @@ class PostgresSink:
             updated_at      = EXCLUDED.updated_at;
     """
 
-    _INSERT_ALERT = """
+    _UPSERT_ALERT = """
         INSERT INTO alerts
-            (alert_id, alert_type, store_id, sku_id,
+            (store_id, sku_id, alert_type, alert_id,
              triggered_at, metric_value, threshold, resolved)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (alert_id) DO NOTHING;
+        ON CONFLICT (store_id, sku_id, alert_type)
+        DO UPDATE SET
+            alert_id     = EXCLUDED.alert_id,
+            triggered_at = EXCLUDED.triggered_at,
+            metric_value = EXCLUDED.metric_value,
+            threshold    = EXCLUDED.threshold,
+            resolved     = EXCLUDED.resolved;
     """
 
     def __init__(self, dsn: str) -> None:
@@ -63,9 +69,9 @@ class PostgresSink:
 
     def insert_alert(self, alert: dict[str, Any]) -> None:
         with self._conn.cursor() as cur:
-            cur.execute(self._INSERT_ALERT, (
-                alert["alert_id"], alert["alert_type"],
+            cur.execute(self._UPSERT_ALERT, (
                 alert["store_id"], alert["sku_id"],
+                alert["alert_type"], alert["alert_id"],
                 alert["triggered_at"], alert["metric_value"],
                 alert["threshold"], alert["resolved"],
             ))

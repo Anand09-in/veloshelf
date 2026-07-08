@@ -31,3 +31,6 @@ tmp*/
 .conda/
 command/
 
+#mlflow
+.mlflow_cooldowns/
+

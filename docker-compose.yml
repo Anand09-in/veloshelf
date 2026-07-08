@@ -1,6 +1,5 @@
-# VeloShelf local stack (Phase 2).
-# Kafka (KRaft) + Postgres + MLflow + Dagster + Flink (jobmanager + taskmanager).
-# Redis kept in for reference; Postgres is the locked-in serving store.
+# VeloShelf local stack (Phase 4).
+# Kafka (KRaft) + Postgres + MLflow + Dagster + Flink + Prometheus + Grafana + Streamlit.
 
 services:
   kafka:
@@ -76,10 +75,15 @@ services:
       - .:/app
     command: >
       bash -c "pip install dagster==1.9.4 dagster-webserver==1.9.4 dagster-graphql==1.9.4 &&
+               pip install -e . &&
                dagster dev -h 0.0.0.0 -p 3000 -f orchestration/definitions.py"
+    environment:
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - POSTGRES_DSN=postgresql://veloshelf:veloshelf@postgres:5432/veloshelf
     depends_on:
       - kafka
       - postgres
+      - mlflow
 
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
@@ -92,14 +96,14 @@ services:
       - kafka
 
   # -------------------------------------------------------------------
-  # Flink (added Phase 2)
+  # Flink (Phase 2)
   # -------------------------------------------------------------------
   flink-jobmanager:
     build:
       context: .
       dockerfile: Dockerfile.flink
     ports:
-      - "8081:8081"     # Flink web UI
+      - "8081:8081"
     command: jobmanager
     environment:
       - "FLINK_PROPERTIES=jobmanager.rpc.address: flink-jobmanager"
@@ -131,6 +135,76 @@ services:
     depends_on:
       - flink-jobmanager
 
+  # -------------------------------------------------------------------
+  # Observability (Phase 4)
+  # -------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.50.1
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/etc/prometheus/console_libraries"
+      - "--web.console.templates=/etc/prometheus/consoles"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:9090/-/healthy || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  grafana:
+    image: grafana/grafana:10.3.3
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=veloshelf
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./serving/grafana/datasource.yml:/etc/grafana/provisioning/datasources/datasource.yml:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+  metrics-exporter:
+    image: python:3.11-slim
+    ports:
+      - "8000:8000"
+    working_dir: /app
+    volumes:
+      - .:/app
+    command: >
+      bash -c "pip install prometheus-client psycopg[binary] python-dotenv mlflow-skinny &&
+                python -m observability.metrics_exporter"
+    environment:
+      - POSTGRES_DSN=postgresql://veloshelf:veloshelf@postgres:5432/veloshelf
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - METRICS_PORT=8000
+    depends_on:
+      - postgres
+      - mlflow
+
+  streamlit:
+    image: python:3.11-slim
+    ports:
+      - "8501:8501"
+    working_dir: /app
+    volumes:
+      - .:/app
+    command: >
+      bash -c "pip install streamlit psycopg[binary] pandas python-dotenv &&
+                streamlit run serving/streamlit_app.py --server.port 8501 --server.address 0.0.0.0"
+    environment:
+      - POSTGRES_DSN=postgresql://veloshelf:veloshelf@postgres:5432/veloshelf
+    depends_on:
+      - postgres
+
 volumes:
   mlflow_data:
   postgres_data:
+  prometheus_data:
+  grafana_data:

@@ -1,0 +1,49 @@
+groups:
+  - name: veloshelf_pipeline
+    rules:
+
+      # Feature freshness — alert if no new features in 5 minutes
+      - alert: FeatureStaleness
+        expr: veloshelf_feature_freshness_lag_seconds > 300
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "VeloShelf feature data is stale"
+          description: >
+            Feature freshness lag is {{ $value }}s (threshold: 300s).
+            The Flink job may be down or the generator has stopped.
+
+      # Data drift — alert if PSI exceeds threshold on any feature
+      - alert: DataDriftDetected
+        expr: veloshelf_drift_detected == 1
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Data drift detected in VeloShelf features"
+          description: >
+            PSI > 0.25 detected on one or more features.
+            Automated retraining will be triggered by Dagster.
+
+      # High stockout alerts — more than 5 unresolved stockout alerts
+      - alert: HighStockoutAlertVolume
+        expr: veloshelf_active_alerts{alert_type="stockout_risk"} > 5
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High number of unresolved stockout alerts"
+          description: >
+            {{ $value }} unresolved stockout-risk alerts across stores.
+
+      # Surge alert spike
+      - alert: SurgeAlertSpike
+        expr: veloshelf_active_alerts{alert_type="surge"} > 3
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Multiple simultaneous surge alerts"
+          description: >
+            {{ $value }} active surge alerts — possible flash demand event.

@@ -204,6 +204,12 @@ class TestMakeFeatureRow:
 
 
 class TestScoreFeatures:
+    @pytest.fixture(autouse=True)
+    def _force_rules(self, monkeypatch):
+        # Pin to rules-only path so tests are deterministic regardless of
+        # whether an ML model is trained and available in MLflow.
+        monkeypatch.setattr("streaming.scoring._detector_loader", False)
+
     def _row(self, on_hand: int = 100, momentum: float = 1.0) -> dict:
         return make_feature_row(
             store_id="DS_001", sku_id="SKU_001",

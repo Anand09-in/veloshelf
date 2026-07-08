@@ -24,18 +24,21 @@ CREATE TABLE windowed_features (
 
 -- ---------------------------------------------------------------------------
 -- Alerts
--- Inserted when a rule threshold is breached.
+-- One row per (store_id, sku_id, alert_type) — upserted each window so the
+-- dashboard always shows current state, not a growing log of events.
 -- resolved=TRUE when the metric drops back below threshold.
 -- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS alerts (
-    alert_id     TEXT        PRIMARY KEY,
-    alert_type   TEXT        NOT NULL CHECK (alert_type IN ('stockout_risk', 'surge')),
+DROP TABLE IF EXISTS alerts CASCADE;
+CREATE TABLE alerts (
     store_id     TEXT        NOT NULL,
     sku_id       TEXT        NOT NULL,
+    alert_type   TEXT        NOT NULL CHECK (alert_type IN ('stockout_risk', 'surge')),
+    alert_id     TEXT        NOT NULL,
     triggered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     metric_value FLOAT       NOT NULL,
     threshold    FLOAT       NOT NULL,
-    resolved     BOOLEAN     NOT NULL DEFAULT FALSE
+    resolved     BOOLEAN     NOT NULL DEFAULT FALSE,
+    PRIMARY KEY (store_id, sku_id, alert_type)
 );
 
 -- ---------------------------------------------------------------------------

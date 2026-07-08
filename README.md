@@ -31,7 +31,7 @@ Services once up:
 
 ## Build phases
 
-0. Foundations ← **you are here**
+0. Foundations 
 1. Ingestion (synthetic event generator)
 2. Stream processing (PyFlink windowed features)
 3. ML layer (Spark training + online scoring)

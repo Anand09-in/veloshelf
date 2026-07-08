@@ -11,11 +11,12 @@ from dagster import Definitions
 from orchestration.assets import (
     detector_promotion,
     detector_training_run,
+    drift_report,
     forecaster_promotion,
     forecaster_training_run,
     windowed_features_parquet,
 )
-from orchestration.schedules import detector_schedule, forecaster_schedule
+from orchestration.schedules import detector_schedule, drift_schedule, forecaster_schedule
 
 defs = Definitions(
     assets=[
@@ -24,9 +25,11 @@ defs = Definitions(
         detector_promotion,
         forecaster_training_run,
         forecaster_promotion,
+        drift_report,
     ],
     schedules=[
         detector_schedule,
         forecaster_schedule,
+        drift_schedule,
     ],
 )
