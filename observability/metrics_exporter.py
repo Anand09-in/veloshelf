@@ -276,9 +276,12 @@ def _poll_mlflow_metrics(tracking_uri: str, interval_s: int = 60) -> None:
                 if runs:
                     m = runs[0].data.metrics
                     for feat in ["order_rate", "depletion_vel", "demand_momentum", "on_hand_est"]:
-                        if f"{feat}_psi"    in m: PSI_GAUGE.labels(feature=feat).set(m[f"{feat}_psi"])
-                        if f"{feat}_ks_stat" in m: KS_GAUGE.labels(feature=feat).set(m[f"{feat}_ks_stat"])
-                        if f"{feat}_js_div"  in m: JS_GAUGE.labels(feature=feat).set(m[f"{feat}_js_div"])
+                        if f"{feat}_psi" in m:
+                            PSI_GAUGE.labels(feature=feat).set(m[f"{feat}_psi"])
+                        if f"{feat}_ks_stat" in m:
+                            KS_GAUGE.labels(feature=feat).set(m[f"{feat}_ks_stat"])
+                        if f"{feat}_js_div" in m:
+                            JS_GAUGE.labels(feature=feat).set(m[f"{feat}_js_div"])
                     if "n_features_drifted" in m:
                         DRIFT_DETECTED.set(1 if m["n_features_drifted"] > 0 else 0)
 

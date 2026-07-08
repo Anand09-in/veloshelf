@@ -227,7 +227,11 @@ def _generate_evidently_report(
     REPORTS_PATH.mkdir(parents=True, exist_ok=True)
 
     try:
-        from evidently import ColumnMapping
+        # Evidently 0.4+ moved ColumnMapping to evidently.pipeline.column_mapping
+        try:
+            from evidently import ColumnMapping
+        except ImportError:
+            from evidently.pipeline.column_mapping import ColumnMapping
         from evidently.metric_preset import DataDriftPreset
         from evidently.report import Report
 
@@ -242,26 +246,27 @@ def _generate_evidently_report(
         logger.info("Evidently HTML report saved: %s", report_path)
 
     except ImportError:
-        # Fallback: plain HTML summary
+        # Fallback: plain HTML summary (no emoji — safe for all encodings)
         rows = "".join(
             f"<tr><td>{f}</td><td>{m['psi']:.4f}</td>"
             f"<td>{m['ks_stat']:.4f}</td><td>{m['js_div']:.4f}</td>"
-            f"<td>{'⚠️ YES' if m['drifted'] else '✅ NO'}</td></tr>"
+            f"<td>{'YES' if m['drifted'] else 'NO'}</td></tr>"
             for f, m in drift_results.items()
         )
-        html = f"""<!DOCTYPE html><html><head><title>VeloShelf Drift Report</title>
+        html = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>VeloShelf Drift Report</title>
 <style>body{{font-family:sans-serif;padding:2rem}}
 table{{border-collapse:collapse;width:100%}}
 th,td{{border:1px solid #ccc;padding:8px;text-align:left}}
 th{{background:#f4f4f4}}</style></head><body>
 <h1>VeloShelf Drift Report</h1>
 <p>Generated: {datetime.now(tz=UTC).isoformat()}</p>
-<p>Reference: last {REFERENCE_WINDOW_H}h · Current: last {CURRENT_WINDOW_H}h ·
+<p>Reference: last {REFERENCE_WINDOW_H}h | Current: last {CURRENT_WINDOW_H}h |
 PSI threshold: {PSI_THRESHOLD}</p>
 <table><tr><th>Feature</th><th>PSI</th><th>KS</th><th>JS</th><th>Drifted?</th></tr>
 {rows}</table></body></html>"""
-        report_path.write_text(html)
-        logger.info("Fallback HTML report saved (evidently not installed): %s", report_path)
+        report_path.write_text(html, encoding="utf-8")
+        logger.info("Fallback HTML report saved: %s", report_path)
 
 
 # ---------------------------------------------------------------------------
