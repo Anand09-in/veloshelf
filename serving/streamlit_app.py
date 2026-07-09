@@ -90,7 +90,7 @@ def fetch_alert_counts() -> dict[str, int]:
 def fetch_stockout_risks(threshold: int) -> pd.DataFrame:
     return query(
         """
-        SELECT store_id, sku_id, category,
+        SELECT store_id, sku_id,
                on_hand_est, depletion_velocity, order_rate, demand_momentum,
                window_end
         FROM windowed_features
@@ -126,16 +126,17 @@ def fetch_surge_alerts() -> pd.DataFrame:
 
 
 def fetch_category_velocity() -> pd.DataFrame:
-    """Per-category order rate pivot: rows=category, cols=store."""
+    """Top SKUs by order rate per store (last 10 min)."""
     return query(
         """
-        SELECT store_id, category,
-               ROUND(AVG(order_rate)::numeric, 3) AS avg_order_rate,
+        SELECT store_id, sku_id,
+               ROUND(AVG(order_rate)::numeric, 3)       AS avg_order_rate,
                ROUND(AVG(depletion_velocity)::numeric, 3) AS avg_depletion
         FROM windowed_features
         WHERE window_end > NOW() - INTERVAL '10 minutes'
-        GROUP BY store_id, category
+        GROUP BY store_id, sku_id
         ORDER BY avg_order_rate DESC
+        LIMIT 60
         """
     )
 
@@ -273,7 +274,7 @@ def render_stockout(threshold: int) -> None:
     )
 
     display = df.rename(columns={
-        "store_id": "Store", "sku_id": "SKU", "category": "Category",
+        "store_id": "Store", "sku_id": "SKU",
         "on_hand_est": "On Hand", "depletion_velocity": "Depletion (u/min)",
         "order_rate": "Order Rate", "demand_momentum": "Momentum",
         "window_end": "Window End",
@@ -334,26 +335,25 @@ def render_velocity() -> None:
     left, right = st.columns(2)
 
     with left:
-        st.markdown("**Order Rate (orders/min) — category × store**")
-        if not df.empty:
-            pivot = df.pivot_table(
-                index="category", columns="store_id",
-                values="avg_order_rate", aggfunc="mean",
-            ).fillna(0).round(3)
-            st.dataframe(pivot, use_container_width=True)
+        st.markdown("**Order Rate (orders/min) — SKU × store**")
+        pivot = df.pivot_table(
+            index="sku_id", columns="store_id",
+            values="avg_order_rate", aggfunc="mean",
+        ).fillna(0).round(3)
+        st.dataframe(pivot, use_container_width=True)
 
     with right:
         st.markdown("**Avg Depletion Velocity (units/min)**")
-        if not df.empty:
-            pivot2 = df.pivot_table(
-                index="category", columns="store_id",
-                values="avg_depletion", aggfunc="mean",
-            ).fillna(0).round(3)
-            st.dataframe(pivot2, use_container_width=True)
+        pivot2 = df.pivot_table(
+            index="sku_id", columns="store_id",
+            values="avg_depletion", aggfunc="mean",
+        ).fillna(0).round(3)
+        st.dataframe(pivot2, use_container_width=True)
 
-    # Bar chart — top categories by total order rate
-    cat_totals = df.groupby("category")["avg_order_rate"].sum().sort_values(ascending=False)
-    st.bar_chart(cat_totals, height=220, color="#2a9d8f")
+    # Bar chart — top SKUs by total order rate across stores
+    sku_totals = df.groupby("sku_id")["avg_order_rate"].sum().sort_values(ascending=False).head(20)
+    st.markdown("**Top 20 SKUs by order rate**")
+    st.bar_chart(sku_totals, height=220, color="#2a9d8f")
 
 
 def render_store_health() -> None:
@@ -480,7 +480,7 @@ def main() -> None:
         render_surges()
 
     with tabs[2]:
-        st.subheader("Live order velocity by category and store")
+        st.subheader("Live order velocity by SKU and store")
         render_velocity()
 
     with tabs[3]:
