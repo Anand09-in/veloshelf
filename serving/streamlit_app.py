@@ -277,7 +277,7 @@ def render_stockout(threshold: int) -> None:
         "window_end": "Window End",
     })
     st.dataframe(
-        display.style.applymap(
+        display.style.map(
             _colour_on_hand, subset=["On Hand"]
         ),
         use_container_width=True,
