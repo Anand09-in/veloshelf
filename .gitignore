@@ -22,6 +22,20 @@ data/output/
 dagster_home/
 tmp*/
 
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfplan
+infra/terraform.tfvars
+infra/.terraform.lock.hcl
+.retrain_cooldowns/
+.mlflow_cooldowns/
+
+# SSH keys
+*.pem
+*.key
+
 # OS / IDE
 .DS_Store
 .idea/
@@ -30,7 +44,4 @@ tmp*/
 #conda
 .conda/
 command/
-
-#mlflow
-.mlflow_cooldowns/
 

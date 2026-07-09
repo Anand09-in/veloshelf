@@ -1,0 +1,165 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:   # allow manual trigger from GitHub UI
+
+permissions:
+  id-token: write    # required for OIDC
+  contents: read
+
+env:
+  AWS_REGION:       ap-south-1
+  TF_WORKING_DIR:   infra
+  TF_VAR_FILE:      terraform.tfvars
+
+jobs:
+  ###########################################################################
+  # Job 1: Terraform plan + apply
+  ###########################################################################
+  terraform:
+    name: Terraform Plan + Apply
+    runs-on: ubuntu-latest
+    environment: production
+
+    outputs:
+      ec2_public_ip: ${{ steps.tf_output.outputs.ec2_public_ip }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC — no stored keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+          terraform_wrapper: false
+
+      - name: Terraform init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=veloshelf/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ secrets.TF_LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
+
+      - name: Write tfvars from secrets
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          cat > terraform.tfvars << EOF
+          aws_region        = "${{ env.AWS_REGION }}"
+          project           = "veloshelf"
+          environment       = "prod"
+          s3_suffix         = "${{ secrets.S3_SUFFIX }}"
+          ec2_instance_type = "t3.small"
+          ec2_key_name      = "${{ secrets.EC2_KEY_NAME }}"
+          rds_instance_class = "db.t3.micro"
+          db_name           = "veloshelf"
+          db_username       = "veloshelf"
+          db_password       = "${{ secrets.DB_PASSWORD }}"
+          EOF
+
+      - name: Terraform plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform plan -out=tfplan -var-file=terraform.tfvars
+
+      - name: Terraform apply
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -auto-approve tfplan
+
+      - name: Capture outputs
+        id: tf_output
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          EC2_IP=$(terraform output -raw ec2_public_ip)
+          echo "ec2_public_ip=$EC2_IP" >> "$GITHUB_OUTPUT"
+
+  ###########################################################################
+  # Job 2: SSH deploy — clone repo + start stack on EC2
+  ###########################################################################
+  deploy:
+    name: SSH Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: terraform
+    environment: production
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Write SSH key
+        run: |
+          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > veloshelf.pem
+          chmod 600 veloshelf.pem
+
+      - name: Wait for EC2 to be ready
+        run: |
+          for i in $(seq 1 12); do
+            ssh -i veloshelf.pem \
+                -o StrictHostKeyChecking=no \
+                -o ConnectTimeout=10 \
+                ec2-user@${{ needs.terraform.outputs.ec2_public_ip }} \
+                "echo ready" && break || sleep 15
+          done
+
+      - name: Deploy VeloShelf to EC2
+        run: |
+          ssh -i veloshelf.pem \
+              -o StrictHostKeyChecking=no \
+              ec2-user@${{ needs.terraform.outputs.ec2_public_ip }} << 'SSHEOF'
+            set -euxo pipefail
+
+            # Clone or pull latest code
+            if [ -d /opt/veloshelf/.git ]; then
+              cd /opt/veloshelf && git pull origin main
+            else
+              git clone https://github.com/${{ github.repository }}.git /opt/veloshelf
+              cd /opt/veloshelf
+            fi
+
+            # .env was written by user_data on first boot — don't overwrite
+            # Just restart the stack with latest code
+            docker compose pull --quiet
+            docker compose up -d --remove-orphans
+
+            # Create Kafka topics if they don't exist
+            sleep 15
+            docker compose exec -T kafka kafka-topics.sh \
+              --bootstrap-server localhost:9092 \
+              --create --if-not-exists \
+              --topic raw-orders --partitions 3 --replication-factor 1
+            docker compose exec -T kafka kafka-topics.sh \
+              --bootstrap-server localhost:9092 \
+              --create --if-not-exists \
+              --topic raw-inventory --partitions 3 --replication-factor 1
+            docker compose exec -T kafka kafka-topics.sh \
+              --bootstrap-server localhost:9092 \
+              --create --if-not-exists \
+              --topic dead-letter --partitions 1 --replication-factor 1
+            docker compose exec -T kafka kafka-topics.sh \
+              --bootstrap-server localhost:9092 \
+              --create --if-not-exists \
+              --topic stockout-alerts --partitions 1 --replication-factor 1
+            docker compose exec -T kafka kafka-topics.sh \
+              --bootstrap-server localhost:9092 \
+              --create --if-not-exists \
+              --topic surge-alerts --partitions 1 --replication-factor 1
+
+            echo "VeloShelf deployed successfully."
+          SSHEOF
+
+      - name: Print service URLs
+        run: |
+          IP=${{ needs.terraform.outputs.ec2_public_ip }}
+          echo "Flink UI:  http://$IP:8081"
+          echo "MLflow:    http://$IP:5000"
+          echo "Dagster:   http://$IP:3000"
