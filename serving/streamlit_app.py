@@ -82,7 +82,7 @@ def fetch_alert_counts() -> dict[str, int]:
     )
     if df.empty:
         return {"stockout": 0, "surge": 0}
-    counts = dict(zip(df["alert_type"], df["cnt"].astype(int)))
+    counts = dict(zip(df["alert_type"], df["cnt"].astype(int), strict=True))
     return {"stockout": counts.get("stockout_risk", 0), "surge": counts.get("surge", 0)}
 
 
