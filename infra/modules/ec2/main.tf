@@ -99,14 +99,6 @@ resource "aws_security_group" "ec2" {
   }
 
   ingress {
-    from_port   = 8081
-    to_port     = 8081
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "Flink Web UI"
-  }
-
-  ingress {
     from_port   = 5000
     to_port     = 5000
     protocol    = "tcp"
@@ -116,10 +108,42 @@ resource "aws_security_group" "ec2" {
 
   ingress {
     from_port   = 3000
-    to_port     = 3000
+    to_port     = 3001
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
-    description = "Dagster"
+    description = "Dagster (3000) and Grafana (3001)"
+  }
+
+  ingress {
+    from_port   = 8080
+    to_port     = 8081
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Kafka UI (8080) and Flink UI (8081)"
+  }
+
+  ingress {
+    from_port   = 8000
+    to_port     = 8000
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Metrics exporter"
+  }
+
+  ingress {
+    from_port   = 8501
+    to_port     = 8501
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Streamlit"
+  }
+
+  ingress {
+    from_port   = 9090
+    to_port     = 9090
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Prometheus"
   }
 
   egress {

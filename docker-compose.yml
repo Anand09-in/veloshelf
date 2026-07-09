@@ -166,6 +166,8 @@ services:
       - GF_USERS_ALLOW_SIGN_UP=false
     volumes:
       - ./serving/grafana/datasource.yml:/etc/grafana/provisioning/datasources/datasource.yml:ro
+      - ./serving/grafana/dashboard.yml:/etc/grafana/provisioning/dashboards/dashboard.yml:ro
+      - ./serving/grafana/veloshelf_dashboard.json:/etc/grafana/provisioning/dashboards/veloshelf_dashboard.json:ro
       - grafana_data:/var/lib/grafana
     depends_on:
       - prometheus
