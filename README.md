@@ -1,5 +1,7 @@
 # VeloShelf
 
+![CI](https://github.com/Anand09-in/veloshelf/actions/workflows/ci.yml/badge.svg)
+
 Real-time inventory intelligence for quick-commerce dark stores — a production-grade streaming ML platform that covers the full lifecycle from raw events to closed-loop model retraining.
 
 ---

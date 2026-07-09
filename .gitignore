@@ -16,6 +16,7 @@ mlflow/
 *.parquet
 data/raw/
 data/output/
+data/reports/
 
 # Dagster
 .dagster/
