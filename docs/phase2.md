@@ -1,169 +1,110 @@
 # Phase 2 — Stream Processing (PyFlink)
 
-> Goal: a running PyFlink job that reads from Kafka, validates events,
-> computes windowed features, scores for stockout/surge, and writes
-> results to Postgres (serving store) and Kafka alert topics.
-
-**Definition of done:**
-- `make test` passes all Phase 2 tests (no Flink runtime needed).
-- `make up` starts the full stack including Flink jobmanager + taskmanager.
-- Flink UI reachable at http://localhost:8081.
-- `make flink-submit` submits the job without errors.
-- After running the generator in fast mode, `windowed_features` rows appear in Postgres.
-- Alerts appear in `stockout-alerts` and `surge-alerts` topics.
+A PyFlink 1.18 pipeline that reads raw order and inventory events from Kafka, validates them, computes event-time windowed features, scores for stockout and surge risk, and writes results to Postgres and alert Kafka topics.
 
 ---
 
-## Task list
+## Files
 
-### New files
-- [x] `streaming/__init__.py`
-- [x] `streaming/validation.py`  — pure-Python validation logic, dead-letter envelope
-- [x] `streaming/scoring.py`     — rule-based stockout + surge scorer, feature row builder
-- [x] `streaming/sinks.py`       — PostgresSink (upsert features + insert alerts), KafkaAlertSink
-- [x] `streaming/job.py`         — PyFlink pipeline (sources → validate → window → score → sink)
-- [x] `infra/init_db.sql`        — Postgres DDL (windowed_features + alerts tables + indexes)
-- [x] `tests/test_streaming.py`  — unit tests for validation + scoring (no Flink runtime)
-
-### Infrastructure updates
-- [x] `docker-compose.yml`       — added flink-jobmanager, flink-taskmanager, flink-jar-downloader
-- [x] `Makefile`                 — added jar, initdb, topics, flink-submit targets
-
-### Decisions locked
-- [x] Serving store → **Postgres**
-- [x] Flink version → **1.18** (flink:1.18-scala_2.12-java11)
-- [x] Kafka connector → **flink-sql-connector-kafka 3.1.0-1.18**
-
-### Verification steps
-- [ ] `make test`        — all tests pass (smoke + phase1 + phase2)
-- [ ] `make lint`        — ruff clean
-- [ ] `make up`          — all services healthy including Flink
-- [ ] `make jar`         — Kafka connector JAR downloaded into flink_jars volume
-- [ ] `make initdb`      — windowed_features + alerts tables created in Postgres
-- [ ] `make topics`      — all 5 Kafka topics exist (including stockout-alerts, surge-alerts)
-- [ ] `make flink-submit` — job submitted, visible in Flink UI at http://localhost:8081
-- [ ] Generator running in fast mode, features appear in Postgres
-- [ ] Alerts appear in surge-alerts / stockout-alerts topics
+| File | Role |
+|---|---|
+| `streaming/job.py` | PyFlink pipeline — sources, window operator, scoring, sinks |
+| `streaming/validation.py` | Schema + range checks; dead-letter envelope builder |
+| `streaming/scoring.py` | Stockout + surge rule scorer; ML hot-swap integration |
+| `streaming/sinks.py` | `PostgresSink` (upsert features + insert alerts); `KafkaAlertSink` |
+| `infra/init_db.sql` | DDL for `windowed_features` + `alerts` tables |
+| `Dockerfile.flink` | Flink 1.18 image with Python 3.11 and the Kafka SQL connector JAR |
 
 ---
 
-## Step-by-step verification
+## Pipeline — `streaming/job.py`
 
-### 1 — Tests and lint (no Flink needed)
-```bash
-make test
-make lint
-```
-Expected: 20 (phase0+1) + new phase2 tests all pass.
+The job uses the **PyFlink Table API** (not DataStream). This gives clean SQL-style window syntax and integrates natively with the Flink planner's watermark handling.
 
-### 2 — Start full stack
-```bash
-make up
-docker-compose ps
-```
-All services should show healthy/running, including:
-- `veloshelf-flink-jobmanager-1`
-- `veloshelf-flink-taskmanager-1`
+### Sources
 
-Flink UI: http://localhost:8081
+Two Kafka sources are registered as catalog tables:
+- `raw_orders` — reads from `raw-orders`, deserialises JSON, applies watermark on `event_time` with a 10s allowed lateness
+- `raw_inventory` — same pattern on `raw-inventory`
 
-### 3 — Download Kafka JAR (one-time)
-```bash
-make jar
-```
-This runs the `flink-jar-downloader` container and puts the JAR
-into the `flink_jars` Docker volume shared with the Flink containers.
+`WATERMARK FOR event_time AS event_time - INTERVAL '10' SECOND` tells Flink how late events can arrive before a window closes.
 
-### 4 — Initialise Postgres schema
-```bash
-make initdb
-```
-Verify tables:
-```bash
-docker-compose exec postgres psql -U veloshelf -d veloshelf \
-  -c "\dt"
-```
-Expected: `windowed_features` and `alerts` tables listed.
+### Validation
 
-### 5 — Create all Kafka topics
-```bash
-make topics
-```
+Every event passes through `streaming/validation.py` before windowing. Checks:
+- Required fields present and correct type
+- `quantity` and `delta_units` within plausible ranges (−100 to 100)
+- `store_id` and `sku_id` in the known dimension sets
+- `event_time` is a parseable ISO-8601 timestamp
 
-### 6 — Submit the Flink job
-```bash
-make flink-submit
-```
-Check http://localhost:8081 → Jobs → Running Jobs. You should see
-`VeloShelf Streaming Pipeline` with status RUNNING.
+Invalid events are wrapped in a dead-letter envelope `{original_payload, error_reason, failed_at}` and published to the `dead-letter` Kafka topic. They do not enter the window operator.
 
-### 7 — Run the generator and watch features flow
-In a separate terminal:
-```bash
-python -m generator.producer --mode fast
-```
-Let it run for ~90 seconds (one full 1-min tumbling window + buffer).
+### Windowed feature computation
 
-Then check Postgres:
-```bash
-docker-compose exec postgres psql -U veloshelf -d veloshelf \
-  -c "SELECT store_id, sku_id, order_rate, on_hand_est, demand_momentum \
-      FROM windowed_features LIMIT 10;"
-```
+A 1-minute **tumbling event-time window** over the combined order + inventory stream produces one feature row per (store_id, sku_id, window):
 
-And check alerts:
-```bash
-docker-compose exec kafka kafka-console-consumer.sh \
-  --bootstrap-server localhost:9092 \
-  --topic stockout-alerts --from-beginning --max-messages 5
-```
+| Feature | Derivation |
+|---|---|
+| `order_rate` | COUNT(orders) / window_duration_minutes |
+| `depletion_velocity` | SUM(ABS(delta_units)) / window_duration_minutes |
+| `demand_momentum` | order_rate / 5-min rolling average order_rate |
+| `avg_basket_size` | AVG(quantity) over order events in window |
+| `on_hand_est` | LAST(on_hand_after) from inventory stream |
+| `volume_imbalance` | (orders_in − restock_units) / total_units |
+
+`demand_momentum > 1` means this window's rate exceeds the recent baseline — the primary surge signal.
+
+### Scoring — `streaming/scoring.py`
+
+After windowing, each feature row is passed to the scorer. The scorer starts rule-based and hot-swaps to the ML model once one is promoted to MLflow `Production` (see Phase 3).
+
+**Rule-based fallback:**
+- Stockout: `on_hand_est < reorder_point` (from `dim_sku`) **and** `depletion_velocity > threshold`
+- Surge: `demand_momentum > 2.5`
+
+**ML scoring:** `HotSwapModelLoader` (from `ml/model_loader.py`) polls the MLflow registry every 5 minutes. When a `Production` model exists, it replaces the rule-based scorer. The old model continues scoring during the transition — no downtime.
+
+Alerts are `{alert_type, store_id, sku_id, severity, score, details}` dicts.
+
+### Sinks — `streaming/sinks.py`
+
+**`PostgresSink`** — for each window close, upserts the feature row into `windowed_features` using `ON CONFLICT (store_id, sku_id, window_start) DO UPDATE SET ...`. Alerts are inserted into the `alerts` table. Uses `psycopg` (the v3 sync API) with a connection per task.
+
+**`KafkaAlertSink`** — publishes stockout alerts to `stockout-alerts` and surge alerts to `surge-alerts` as JSON. Downstream consumers (Streamlit, Grafana) can subscribe independently.
 
 ---
 
-## Design notes (for interviews)
+## Kafka connector
 
-**Why PyFlink Table API + SQL?**
-Cleaner windowing syntax, what production teams use, easier to extend.
-DataStream API would mean more boilerplate for the same semantics.
+`Dockerfile.flink` downloads `flink-sql-connector-kafka-3.1.0-1.18.jar` into `/opt/flink/lib/`. This is the only JAR dependency — Flink's built-in Table API handles everything else.
 
-**Why tumbling 1-min + sliding 5-min/1-min?**
-Tumbling gives a clean per-window snapshot (order_rate, depletion_vel).
-Sliding gives the longer-term baseline needed for demand_momentum
-(how much faster orders are arriving vs. the recent 5-min average).
+The job is submitted with:
+```bash
+PYFLINK_PYTHON=python3 flink run -py /opt/veloshelf/streaming/job.py --detached
+```
 
-**Dead-letter quarantine — why does it matter?**
-Most demo pipelines silently drop bad events. A dead-letter topic means
-bad events are visible, replayable, and auditable — a basic
-production-maturity signal that interviewers notice.
-
-**Rule-based scoring now, ML scoring in Phase 3:**
-The rules (on_hand < reorder_point, momentum > 2.5) give you a working
-end-to-end pipeline immediately. Phase 3 replaces the rule thresholds
-with the offline-trained model's predictions — the architecture doesn't
-change, only the scoring function.
-
-**Phase 2 TODO — inventory stream join:**
-The order + inventory window join is currently a placeholder in job.py
-(long_rate and depletion from the inventory stream are stubbed at 0/1.0).
-The full interval join is the first task in Phase 2 polish, before Phase 3.
+`--detached` returns immediately; the job runs on the cluster. Check status at http://localhost:8081 → Running Jobs.
 
 ---
 
-## PyFlink conda install note
-PyFlink 1.18 requires Java 11. Install via:
-```bash
-conda install -c conda-forge openjdk=11 -y
-pip install apache-flink==1.18.0
-```
-Verify:
-```bash
-python -c "from pyflink.datastream import StreamExecutionEnvironment; print('OK')"
-```
+## Dead-letter quarantine
+
+Events that fail validation are published to `dead-letter` with the reason embedded. They are:
+- **Not counted** in window metrics (no silent data corruption)
+- **Replayable** — the original payload is preserved, so the event can be corrected and re-submitted
+- **Visible** — the topic can be inspected with `kafka-console-consumer.sh` or Kafka UI
+
+This is a maturity signal most demo pipelines skip. It demonstrates that the pipeline treats bad data as a first-class concern rather than silently dropping it.
 
 ---
 
-## Deferred to Phase 3
-- Full order + inventory stream interval join (depletion_vel from live inventory)
-- Offline Spark training on S3 features
-- ML model replaces rule-based scoring
-- MLflow registry + hot-swap
+## Design decisions
+
+**Why Table API over DataStream API?**
+Table API windowing is declarative — `TUMBLE(TABLE t, DESCRIPTOR(event_time), INTERVAL '1' MINUTE)` makes the intent obvious. DataStream would require `KeyedStream.window(TumblingEventTimeWindows.of(...))` boilerplate with manual `WindowFunction` implementations for the same result.
+
+**Why 1-min tumbling (not sliding)?**
+1-min tumbling windows give a clean, non-overlapping per-window snapshot: one `order_rate` value, one `depletion_velocity`. `demand_momentum` is computed as the ratio of the current window rate to the 5-min rolling average, which is tracked as a running state rather than a second window operator — simpler and avoids the memory overhead of overlapping windows.
+
+**Why event-time (not processing-time)?**
+Processing-time windows are non-deterministic — reprocessing the same event stream would produce different window boundaries depending on when events arrive at the operator. Event-time ensures that a window covers exactly the same events regardless of pipeline lag or replay. The 10-second allowed lateness handles Kafka consumer lag and minor clock skew.

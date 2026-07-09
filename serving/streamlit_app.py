@@ -1,15 +1,7 @@
-"""VeloShelf — Streamlit business dashboard (Phase 4).
+"""VeloShelf — Streamlit business dashboard.
 
 Business-facing live view reading from Postgres windowed_features + alerts.
 Designed for a supply-chain manager or ops lead, not an engineer.
-
-Panels:
-  1. Header     — pipeline freshness status + overall health badge
-  2. Stockout   — SKUs at risk sorted by depletion velocity (worst first)
-  3. Surge      — active surge alerts sorted by momentum
-  4. Velocity   — per-category order rate heatmap across stores
-  5. Store view — per-store health summary (avg on_hand, alert count)
-  6. Drift      — latest PSI / KS / JS per feature (from data/reports/)
 
 Run:
     streamlit run serving/streamlit_app.py
@@ -31,11 +23,11 @@ st.set_page_config(
     page_title="VeloShelf — Dark Store Intelligence",
     page_icon="🛒",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
 # ---------------------------------------------------------------------------
-# DB connection
+# Config
 # ---------------------------------------------------------------------------
 POSTGRES_DSN = os.getenv(
     "POSTGRES_DSN",
@@ -44,7 +36,12 @@ POSTGRES_DSN = os.getenv(
 REPORTS_PATH = Path(os.getenv("REPORTS_PATH", "data/reports"))
 REFRESH_S    = int(os.getenv("DASHBOARD_REFRESH_S", "30"))
 
+# Alert lookback window (minutes) — alerts table has no 'resolved' column
+ALERT_WINDOW_MIN = 15
 
+# ---------------------------------------------------------------------------
+# DB connection
+# ---------------------------------------------------------------------------
 @st.cache_resource
 def get_connection():
     import psycopg
@@ -61,62 +58,11 @@ def query(sql: str, params: tuple = ()) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Data fetchers
+# Data fetchers — column names match actual windowed_features + alerts schema
 # ---------------------------------------------------------------------------
 
-def fetch_features() -> pd.DataFrame:
-    return query("""
-        SELECT store_id, sku_id, order_rate, depletion_vel,
-               demand_momentum, on_hand_est, updated_at
-        FROM windowed_features
-        ORDER BY updated_at DESC
-    """)
-
-
-def fetch_active_alerts() -> pd.DataFrame:
-    return query("""
-        SELECT alert_id, alert_type, store_id, sku_id,
-               triggered_at, metric_value, threshold
-        FROM alerts
-        WHERE resolved = FALSE
-        ORDER BY triggered_at DESC
-    """)
-
-
-def fetch_stockout_risks(reorder_threshold: int = 40) -> pd.DataFrame:
-    return query("""
-        SELECT store_id, sku_id, on_hand_est, depletion_vel,
-               order_rate, demand_momentum, updated_at
-        FROM windowed_features
-        WHERE on_hand_est <= %s
-        ORDER BY depletion_vel DESC
-    """, (reorder_threshold,))
-
-
-def fetch_surge_alerts() -> pd.DataFrame:
-    return query("""
-        SELECT a.store_id, a.sku_id, a.metric_value AS momentum,
-               a.triggered_at, f.order_rate, f.on_hand_est
-        FROM alerts a
-        LEFT JOIN windowed_features f
-          ON a.store_id = f.store_id AND a.sku_id = f.sku_id
-        WHERE a.alert_type = 'surge' AND a.resolved = FALSE
-        ORDER BY a.metric_value DESC
-    """)
-
-
-def fetch_category_velocity() -> pd.DataFrame:
-    """Join features with seed SKU data to get per-category rates."""
-    return query("""
-        SELECT store_id, sku_id,
-               order_rate, depletion_vel, on_hand_est
-        FROM windowed_features
-        ORDER BY order_rate DESC
-    """)
-
-
 def fetch_freshness() -> dict:
-    df = query("SELECT MAX(updated_at) AS latest FROM windowed_features")
+    df = query("SELECT MAX(window_end) AS latest FROM windowed_features")
     if df.empty or df["latest"].isna().all():
         return {"lag_s": None, "status": "no_data"}
     latest = pd.to_datetime(df["latest"].iloc[0], utc=True)
@@ -125,19 +71,130 @@ def fetch_freshness() -> dict:
     return {"lag_s": lag_s, "latest": latest, "status": status}
 
 
-def load_latest_drift_report() -> dict | None:
-    """Load the most recent drift metrics from MLflow run JSON if available."""
+def fetch_alert_counts() -> dict[str, int]:
+    df = query(
+        """
+        SELECT alert_type, COUNT(*) AS cnt
+        FROM alerts
+        WHERE triggered_at > NOW() - INTERVAL '%s minutes'
+        GROUP BY alert_type
+        """,
+        (ALERT_WINDOW_MIN,),
+    )
+    if df.empty:
+        return {"stockout": 0, "surge": 0}
+    counts = dict(zip(df["alert_type"], df["cnt"].astype(int)))
+    return {"stockout": counts.get("stockout", 0), "surge": counts.get("surge", 0)}
+
+
+def fetch_stockout_risks(threshold: int) -> pd.DataFrame:
+    return query(
+        """
+        SELECT store_id, sku_id, category,
+               on_hand_est, depletion_velocity, order_rate, demand_momentum,
+               window_end
+        FROM windowed_features
+        WHERE on_hand_est <= %s
+        ORDER BY depletion_velocity DESC
+        LIMIT 50
+        """,
+        (threshold,),
+    )
+
+
+def fetch_surge_alerts() -> pd.DataFrame:
+    return query(
+        """
+        SELECT a.store_id, a.sku_id, a.severity, a.score,
+               a.triggered_at,
+               f.order_rate, f.demand_momentum, f.on_hand_est
+        FROM alerts a
+        LEFT JOIN LATERAL (
+            SELECT order_rate, demand_momentum, on_hand_est
+            FROM windowed_features f2
+            WHERE f2.store_id = a.store_id AND f2.sku_id = a.sku_id
+            ORDER BY window_end DESC
+            LIMIT 1
+        ) f ON true
+        WHERE a.alert_type = 'surge'
+          AND a.triggered_at > NOW() - INTERVAL '%s minutes'
+        ORDER BY a.score DESC
+        LIMIT 30
+        """,
+        (ALERT_WINDOW_MIN,),
+    )
+
+
+def fetch_category_velocity() -> pd.DataFrame:
+    """Per-category order rate pivot: rows=category, cols=store."""
+    return query(
+        """
+        SELECT store_id, category,
+               ROUND(AVG(order_rate)::numeric, 3) AS avg_order_rate,
+               ROUND(AVG(depletion_velocity)::numeric, 3) AS avg_depletion
+        FROM windowed_features
+        WHERE window_end > NOW() - INTERVAL '10 minutes'
+        GROUP BY store_id, category
+        ORDER BY avg_order_rate DESC
+        """
+    )
+
+
+def fetch_store_health() -> pd.DataFrame:
+    """Per-store aggregate from the most recent window per SKU."""
+    return query(
+        """
+        SELECT
+            wf.store_id,
+            ROUND(AVG(wf.on_hand_est)::numeric, 1)         AS avg_on_hand,
+            ROUND(AVG(wf.order_rate)::numeric, 3)           AS avg_order_rate,
+            ROUND(AVG(wf.demand_momentum)::numeric, 2)      AS avg_momentum,
+            COUNT(DISTINCT wf.sku_id)                        AS active_skus,
+            COALESCE(a.alert_cnt, 0)                         AS recent_alerts
+        FROM windowed_features wf
+        LEFT JOIN (
+            SELECT store_id, COUNT(*) AS alert_cnt
+            FROM alerts
+            WHERE triggered_at > NOW() - INTERVAL '%s minutes'
+            GROUP BY store_id
+        ) a ON a.store_id = wf.store_id
+        GROUP BY wf.store_id, a.alert_cnt
+        ORDER BY recent_alerts DESC
+        """,
+        (ALERT_WINDOW_MIN,),
+    )
+
+
+def fetch_recent_alerts_log() -> pd.DataFrame:
+    return query(
+        """
+        SELECT alert_type, store_id, sku_id, severity, score, triggered_at
+        FROM alerts
+        WHERE triggered_at > NOW() - INTERVAL '%s minutes'
+        ORDER BY triggered_at DESC
+        LIMIT 100
+        """,
+        (ALERT_WINDOW_MIN,),
+    )
+
+
+def load_latest_drift_report() -> Path | None:
     files = sorted(REPORTS_PATH.glob("drift_*.html"), reverse=True)
-    return {"report_path": str(files[0])} if files else None
+    return files[0] if files else None
 
 
 # ---------------------------------------------------------------------------
 # UI helpers
 # ---------------------------------------------------------------------------
 
-def status_badge(status: str) -> str:
-    return {"healthy": "🟢 Healthy", "stale": "🟡 Stale", "down": "🔴 Down",
-            "no_data": "⚫ No data"}.get(status, "⚫ Unknown")
+STATUS_MAP = {
+    "healthy": ("🟢", "Healthy"),
+    "stale":   ("🟡", "Stale"),
+    "down":    ("🔴", "Down"),
+    "no_data": ("⚫", "No data"),
+}
+
+SEVERITY_COLOUR = {"high": "🔴", "medium": "🟡", "low": "🟢"}
 
 
 def _fmt_lag(lag_s: float | None) -> str:
@@ -148,8 +205,241 @@ def _fmt_lag(lag_s: float | None) -> str:
     return f"{lag_s / 60:.1f}m ago"
 
 
+def _colour_on_hand(val: float, low: int = 20, mid: int = 50) -> str:
+    if val <= low:
+        return "background-color: #ffcccc"
+    if val <= mid:
+        return "background-color: #fff3cc"
+    return ""
+
+
 # ---------------------------------------------------------------------------
-# Main dashboard
+# Sidebar
+# ---------------------------------------------------------------------------
+
+def render_sidebar() -> int:
+    st.sidebar.header("Controls")
+    threshold = st.sidebar.slider(
+        "Stockout reorder threshold (on-hand units)",
+        min_value=5, max_value=100, value=40, step=5,
+    )
+    st.sidebar.markdown("---")
+    st.sidebar.markdown(
+        f"**Alert lookback:** last {ALERT_WINDOW_MIN} min  \n"
+        f"**Auto-refresh:** every {REFRESH_S}s"
+    )
+    st.sidebar.markdown("---")
+    st.sidebar.caption("PSI thresholds")
+    st.sidebar.markdown(
+        "🟢 < 0.10 — stable  \n"
+        "🟡 0.10–0.25 — moderate  \n"
+        "🔴 > 0.25 — significant drift"
+    )
+    return threshold
+
+
+# ---------------------------------------------------------------------------
+# Panels
+# ---------------------------------------------------------------------------
+
+def render_header(freshness: dict, alert_counts: dict) -> None:
+    icon, label = STATUS_MAP.get(freshness["status"], ("⚫", "Unknown"))
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Pipeline", f"{icon} {label}")
+    c2.metric("Last Window", _fmt_lag(freshness.get("lag_s")))
+    c3.metric("Stockout Alerts", alert_counts["stockout"], delta=None)
+    c4.metric("Surge Alerts", alert_counts["surge"], delta=None)
+
+
+def render_stockout(threshold: int) -> None:
+    df = fetch_stockout_risks(threshold)
+    if df.empty:
+        st.success(f"No SKUs below {threshold} units. All stores healthy.")
+        return
+
+    st.caption(f"{len(df)} SKU(s) at risk · sorted by depletion rate")
+
+    # Bar chart — on_hand_est per SKU (worst first)
+    chart_df = (
+        df[["sku_id", "store_id", "on_hand_est"]]
+        .head(20)
+        .copy()
+    )
+    chart_df["label"] = chart_df["sku_id"] + " / " + chart_df["store_id"]
+    st.bar_chart(
+        chart_df.set_index("label")["on_hand_est"],
+        height=220,
+        color="#e63946",
+    )
+
+    display = df.rename(columns={
+        "store_id": "Store", "sku_id": "SKU", "category": "Category",
+        "on_hand_est": "On Hand", "depletion_velocity": "Depletion (u/min)",
+        "order_rate": "Order Rate", "demand_momentum": "Momentum",
+        "window_end": "Window End",
+    })
+    st.dataframe(
+        display.style.applymap(
+            _colour_on_hand, subset=["On Hand"]
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+def render_surges() -> None:
+    df = fetch_surge_alerts()
+    if df.empty:
+        st.info(f"No surge alerts in the last {ALERT_WINDOW_MIN} minutes.")
+        return
+
+    st.caption(f"{len(df)} active surge(s) · sorted by score")
+
+    # Score bar chart
+    if not df.empty and "score" in df.columns:
+        chart_df = df[["sku_id", "store_id", "score"]].head(15).copy()
+        chart_df["label"] = chart_df["sku_id"] + " / " + chart_df["store_id"]
+        st.bar_chart(
+            chart_df.set_index("label")["score"],
+            height=200,
+            color="#f4a261",
+        )
+
+    # Severity icon column
+    if "severity" in df.columns:
+        df["sev"] = df["severity"].map(SEVERITY_COLOUR).fillna("⚪")
+        cols = ["sev", "store_id", "sku_id", "score", "order_rate",
+                "demand_momentum", "on_hand_est", "triggered_at"]
+        cols = [c for c in cols if c in df.columns]
+        df = df[cols]
+
+    st.dataframe(
+        df.rename(columns={
+            "sev": "", "store_id": "Store", "sku_id": "SKU",
+            "score": "Score", "order_rate": "Order Rate",
+            "demand_momentum": "Momentum", "on_hand_est": "On Hand",
+            "triggered_at": "Triggered At",
+        }),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+def render_velocity() -> None:
+    df = fetch_category_velocity()
+    if df.empty:
+        st.info("No feature data in the last 10 minutes.")
+        return
+
+    left, right = st.columns(2)
+
+    with left:
+        st.markdown("**Order Rate (orders/min) — category × store**")
+        if not df.empty:
+            pivot = df.pivot_table(
+                index="category", columns="store_id",
+                values="avg_order_rate", aggfunc="mean",
+            ).fillna(0).round(3)
+            st.dataframe(pivot, use_container_width=True)
+
+    with right:
+        st.markdown("**Avg Depletion Velocity (units/min)**")
+        if not df.empty:
+            pivot2 = df.pivot_table(
+                index="category", columns="store_id",
+                values="avg_depletion", aggfunc="mean",
+            ).fillna(0).round(3)
+            st.dataframe(pivot2, use_container_width=True)
+
+    # Bar chart — top categories by total order rate
+    cat_totals = df.groupby("category")["avg_order_rate"].sum().sort_values(ascending=False)
+    st.bar_chart(cat_totals, height=220, color="#2a9d8f")
+
+
+def render_store_health() -> None:
+    df = fetch_store_health()
+    if df.empty:
+        st.info("No store data available.")
+        return
+
+    # Alert count bar
+    if "recent_alerts" in df.columns:
+        st.bar_chart(
+            df.set_index("store_id")["recent_alerts"],
+            height=180,
+            color="#e76f51",
+        )
+
+    st.dataframe(
+        df.rename(columns={
+            "store_id": "Store",
+            "avg_on_hand": "Avg On Hand",
+            "avg_order_rate": "Avg Order Rate",
+            "avg_momentum": "Avg Momentum",
+            "active_skus": "Active SKUs",
+            "recent_alerts": f"Alerts (last {ALERT_WINDOW_MIN}m)",
+        }),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    # Recent alert log
+    log = fetch_recent_alerts_log()
+    if not log.empty:
+        with st.expander(f"Alert log — last {ALERT_WINDOW_MIN} min ({len(log)} events)"):
+            log["sev"] = log["severity"].map(SEVERITY_COLOUR).fillna("⚪")
+            st.dataframe(
+                log[["sev", "alert_type", "store_id", "sku_id", "score", "triggered_at"]].rename(
+                    columns={"sev": "", "alert_type": "Type", "store_id": "Store",
+                             "sku_id": "SKU", "score": "Score", "triggered_at": "Time"}
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+
+def render_drift() -> None:
+    report = load_latest_drift_report()
+
+    col1, col2, col3 = st.columns(3)
+    col1.markdown("**PSI < 0.10**  \n🟢 Stable")
+    col2.markdown("**PSI 0.10–0.25**  \n🟡 Moderate shift")
+    col3.markdown("**PSI > 0.25**  \n🔴 Significant — retrain triggered")
+
+    st.divider()
+
+    if report:
+        st.success(f"Latest report: `{report}`")
+        try:
+            with open(report, "rb") as f:
+                st.download_button(
+                    "Download Evidently report (HTML)",
+                    data=f,
+                    file_name=report.name,
+                    mime="text/html",
+                )
+        except OSError:
+            pass
+        st.info(
+            "The Evidently report contains interactive PSI / KS / JS distributions "
+            "per feature. Open it in a browser for the full analysis."
+        )
+        # List all available reports
+        all_reports = sorted(REPORTS_PATH.glob("drift_*.html"), reverse=True)
+        if len(all_reports) > 1:
+            with st.expander(f"All reports ({len(all_reports)})"):
+                for r in all_reports:
+                    st.caption(str(r))
+    else:
+        st.warning(
+            "No drift reports yet.  \n"
+            "Run: `python -m observability.drift_job`  \n"
+            "Or wait for the Dagster `drift_check_schedule` (every 2h)."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Main
 # ---------------------------------------------------------------------------
 
 def main() -> None:
@@ -159,134 +449,47 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
-    # ---- Header ----
+    threshold = render_sidebar()
+
     st.title("🛒 VeloShelf — Dark Store Intelligence")
-    freshness = fetch_freshness()
-    alerts_df = fetch_active_alerts()
-
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Pipeline Status", status_badge(freshness["status"]))
-    col2.metric("Last Feature", _fmt_lag(freshness.get("lag_s")))
-    stockout_count = (
-        str(len(alerts_df[alerts_df["alert_type"] == "stockout_risk"]))
-        if not alerts_df.empty else "0"
-    )
-    col3.metric("Active Stockout Alerts", stockout_count)
-    col4.metric(
-        "Active Surge Alerts",
-        str(len(alerts_df[alerts_df["alert_type"] == "surge"])) if not alerts_df.empty else "0",
-    )
-
-    st.divider()
-
-    # ---- Stockout Risks ----
-    st.subheader("⚠️ Stockout Risk — SKUs Below Reorder Point")
-    stockout_df = fetch_stockout_risks()
-    if stockout_df.empty:
-        st.success("No SKUs currently below reorder threshold.")
-    else:
-        st.dataframe(
-            stockout_df.rename(columns={
-                "store_id": "Store", "sku_id": "SKU",
-                "on_hand_est": "On Hand", "depletion_vel": "Depletion Vel (units/min)",
-                "order_rate": "Order Rate (orders/min)", "demand_momentum": "Momentum",
-                "updated_at": "Last Updated",
-            }),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    st.divider()
-
-    # ---- Surge Alerts ----
-    st.subheader("🚀 Active Demand Surges")
-    surge_df = fetch_surge_alerts()
-    if surge_df.empty:
-        st.info("No active surge alerts.")
-    else:
-        st.dataframe(
-            surge_df.rename(columns={
-                "store_id": "Store", "sku_id": "SKU",
-                "momentum": "Demand Momentum", "triggered_at": "Triggered At",
-                "order_rate": "Order Rate", "on_hand_est": "On Hand",
-            }),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    st.divider()
-
-    # ---- Category velocity ----
-    st.subheader("📦 Live Order Velocity by Store")
-    velocity_df = fetch_category_velocity()
-    if not velocity_df.empty:
-        pivot = velocity_df.pivot_table(
-            index="sku_id", columns="store_id",
-            values="order_rate", aggfunc="mean",
-        ).fillna(0).round(3)
-        st.dataframe(pivot, use_container_width=True)
-    else:
-        st.info("No feature data available yet.")
-
-    st.divider()
-
-    # ---- Store health summary ----
-    st.subheader("🏪 Store Health Summary")
-    features_df = fetch_features()
-    if not features_df.empty:
-        store_summary = (
-            features_df
-            .groupby("store_id")
-            .agg(
-                avg_on_hand=("on_hand_est", "mean"),
-                avg_order_rate=("order_rate", "mean"),
-                avg_momentum=("demand_momentum", "mean"),
-            )
-            .round(2)
-            .reset_index()
-        )
-        if not alerts_df.empty:
-            alert_counts = (
-                alerts_df.groupby("store_id")
-                .size()
-                .reset_index(name="active_alerts")
-            )
-            store_summary = store_summary.merge(alert_counts, on="store_id", how="left")
-            store_summary["active_alerts"] = store_summary["active_alerts"].fillna(0).astype(int)
-        st.dataframe(
-            store_summary.rename(columns={
-                "store_id": "Store",
-                "avg_on_hand": "Avg On Hand",
-                "avg_order_rate": "Avg Order Rate",
-                "avg_momentum": "Avg Momentum",
-                "active_alerts": "Active Alerts",
-            }),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    st.divider()
-
-    # ---- Drift panel ----
-    st.subheader("📊 Data Drift — Latest Report")
-    drift = load_latest_drift_report()
-    if drift:
-        st.success(f"Latest report: `{drift['report_path']}`")
-        st.info(
-            "Open the HTML report in your browser for the full Evidently "
-            "drift analysis (PSI / KS / JS per feature)."
-        )
-        st.caption(
-            "PSI rule: < 0.10 stable · 0.10–0.25 moderate · > 0.25 significant drift"
-        )
-    else:
-        st.info("No drift reports yet. Run `python -m observability.drift_job` first.")
-
-    # ---- Footer ----
     st.caption(
-        f"VeloShelf · auto-refreshes every {REFRESH_S}s · "
-        f"last render: {datetime.now(tz=UTC).strftime('%H:%M:%S UTC')}"
+        f"Last render: {datetime.now(tz=UTC).strftime('%H:%M:%S UTC')} · "
+        f"auto-refreshes every {REFRESH_S}s"
     )
+
+    freshness    = fetch_freshness()
+    alert_counts = fetch_alert_counts()
+    render_header(freshness, alert_counts)
+
+    st.divider()
+
+    tabs = st.tabs([
+        "⚠️ Stockout Risk",
+        "🚀 Demand Surges",
+        "📦 Category Velocity",
+        "🏪 Store Health",
+        "📊 Drift",
+    ])
+
+    with tabs[0]:
+        st.subheader(f"SKUs below {threshold} units on hand")
+        render_stockout(threshold)
+
+    with tabs[1]:
+        st.subheader(f"Active surge alerts — last {ALERT_WINDOW_MIN} min")
+        render_surges()
+
+    with tabs[2]:
+        st.subheader("Live order velocity by category and store")
+        render_velocity()
+
+    with tabs[3]:
+        st.subheader("Per-store health summary")
+        render_store_health()
+
+    with tabs[4]:
+        st.subheader("Data drift — Evidently reports")
+        render_drift()
 
 
 if __name__ == "__main__":

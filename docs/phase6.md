@@ -1,210 +1,184 @@
-# Phase 6 — IaC, CI/CD, and Polish
+# Phase 6 — IaC and CI/CD
 
-> Goal: Terraform-provisioned AWS infrastructure, GitHub Actions CI/CD with
-> OIDC (zero stored credentials), and a polished README ready for the portfolio.
-
-**Definition of done:**
-- `terraform plan` runs without errors from a clean clone.
-- GitHub Actions CI passes on every PR (lint + test).
-- GitHub Actions Deploy runs on merge to main (Terraform apply + SSH deploy).
-- README clearly communicates the project's value, architecture, and stack.
+Terraform modules provisioning the AWS stack, GitHub Actions CI/CD with OIDC authentication (zero stored credentials), and Makefile targets for cost control. The full VeloShelf stack runs on a single EC2 instance using Docker Compose, with RDS for durable Postgres storage and S3 for Parquet features and MLflow artefacts.
 
 ---
 
-## Task list
+## Terraform structure
 
-### New files
-- [x] `infra/main.tf`                    — root Terraform module
-- [x] `infra/variables.tf`               — all input variables
-- [x] `infra/terraform.tfvars.example`   — template (gitignored tfvars)
-- [x] `infra/modules/networking/main.tf` — VPC, subnets, IGW, route tables
-- [x] `infra/modules/s3/main.tf`         — features + MLflow S3 buckets
-- [x] `infra/modules/rds/main.tf`        — RDS Postgres t3.micro
-- [x] `infra/modules/ec2/main.tf`        — EC2 t3.small, IAM role, SG, user_data
-- [x] `infra/modules/eks/main.tf`        — EKS design intent (NOT applied)
-- [x] `.github/workflows/ci.yml`         — lint + test + Docker build check
-- [x] `.github/workflows/deploy.yml`     — OIDC → Terraform apply → SSH deploy
-- [x] `README.md`                        — portfolio README with architecture + quickstart
-
-### Updated files
-- [x] `.gitignore`                       — added Terraform + SSH key patterns
-
-### Verification steps
-- [ ] `terraform init` runs without errors
-- [ ] `terraform validate` passes
-- [ ] `terraform plan` produces expected resource list
-- [ ] GitHub Actions CI passes on a PR
-- [ ] GitHub secrets configured (see below)
-- [ ] GitHub Actions Deploy runs on merge to main
-- [ ] EC2 + RDS + S3 provisioned on AWS
-- [ ] SSH deploy succeeds (`make up` on EC2)
-- [ ] README renders correctly on GitHub
+```
+infra/
+├── main.tf                    # Root module — wires all sub-modules
+├── variables.tf               # Input variables with defaults
+├── terraform.tfvars           # Real values (gitignored)
+├── terraform.tfvars.example   # Template for new contributors
+└── modules/
+    ├── networking/main.tf     # VPC, subnets, IGW, route tables
+    ├── ec2/main.tf            # Instance, IAM role, security group, user_data
+    ├── rds/main.tf            # RDS Postgres, DB subnet group, SG
+    └── s3/main.tf             # Features bucket + MLflow artefact bucket
+```
 
 ---
 
-## Architecture decision — why not one big EC2?
+## Modules
 
-Running Grafana + Prometheus + Streamlit + Postgres + Kafka + Flink + MLflow +
-Dagster on a single t3.micro/small is resource contention, not production
-engineering. The split is:
+### `modules/networking`
 
-| What | Where | Why |
-|---|---|---|
-| Kafka + Flink + MLflow + Dagster | EC2 t3.small | core streaming, needs to be always-on |
-| Postgres (windowed_features + alerts) | RDS t3.micro | managed, free-tier, no OOM risk |
-| S3 (features + MLflow artifacts) | S3 | serverless, persistent, cheap |
-| Grafana + Prometheus + Streamlit | local dev only | not needed 24/7 for a demo |
-| EKS | design intent (k8s/ + infra/modules/eks/) | production evolution, not demo |
+Creates a VPC (`10.0.0.0/16`) with two public subnets in different AZs (required for the RDS DB subnet group). An Internet Gateway and a route table with `0.0.0.0/0 → IGW` make both subnets publicly routable.
 
-This is the "right-sized for the problem" story — a strong interview answer.
+Outputs: `vpc_id`, `subnet_ids` (list of two), `vpc_cidr`.
+
+### `modules/s3`
+
+Two S3 buckets, both with versioning enabled and all-public-access blocked:
+- `veloshelf-features-{suffix}` — stores Parquet feature exports from `ml/export_features.py`
+- `veloshelf-mlflow-{suffix}` — MLflow artefact root (model binaries, Evidently reports)
+
+`{suffix}` is the AWS account ID, making bucket names globally unique without a random suffix that changes on destroy/recreate.
+
+Outputs: `features_bucket_name`, `features_bucket_arn`, `mlflow_bucket_name`, `mlflow_bucket_arn`.
+
+### `modules/rds`
+
+RDS Postgres 16 on `db.t3.micro` (free-tier eligible). Key settings:
+- `multi_az = false` — single-AZ for cost
+- `publicly_accessible = false` — only reachable from within the VPC
+- `backup_retention_period = 0` — disables automated backups (saves storage cost; this is a demo)
+- `skip_final_snapshot = true` — allows `terraform destroy` without a manual snapshot step
+
+Security group ingress: CIDR `var.vpc_cidr` (10.0.0.0/16) on port 5432 — any EC2 in the VPC can connect, no per-instance SG coupling needed. This avoids the circular dependency that would result from referencing the EC2 SG (EC2 module would need RDS endpoint → RDS module would need EC2 SG → deadlock).
+
+DB subnet group uses both public subnets. RDS is placed in a public subnet but `publicly_accessible = false` means the endpoint is only routable from within the VPC.
+
+### `modules/ec2`
+
+EC2 `m7i-flex.large` (8 vCPU, 16 GB RAM — needed to run 12 Docker containers without OOM). Key resources:
+
+**IAM role**: `veloshelf-ec2-role` with a policy granting `s3:GetObject`, `s3:PutObject`, `s3:ListBucket` on both S3 buckets. The role is attached as an instance profile, so Docker containers on the EC2 can use the Instance Metadata Service for credentials — no access keys stored anywhere.
+
+**Security group**: inbound rules for:
+
+| Port(s) | Purpose |
+|---|---|
+| 22 | SSH (from `0.0.0.0/0` for demo; restrict to your IP in production) |
+| 9092 | Kafka external listener |
+| 5432 | Postgres (from VPC CIDR; RDS is not exposed externally) |
+| 5000 | MLflow UI |
+| 3000 | Dagster UI |
+| 3001 | Grafana UI |
+| 8080–8081 | Kafka UI / Flink UI |
+| 8000 | Metrics exporter |
+| 8501 | Streamlit |
+| 9090 | Prometheus |
+
+All outbound traffic is allowed.
+
+**`user_data` bootstrap script**: runs at first boot via cloud-init:
+1. Installs Docker and Docker Compose
+2. Adds `ec2-user` to the `docker` group
+3. Writes `/home/ec2-user/app/.env` with RDS endpoint, S3 bucket names, and Postgres DSN (interpolated from Terraform variables)
+4. Does **not** start the stack — that's done via `make ec2-ssh` + `docker compose up -d` after cloning the repo
+
+### State backend — `main.tf`
+
+```hcl
+backend "s3" {
+  bucket     = "veloshelf-tfstate-798644229089"
+  key        = "veloshelf/terraform.tfstate"
+  region     = "ap-south-1"
+  encrypt    = true
+  use_lockfile = true
+}
+```
+
+`use_lockfile = true` uses native S3 conditional writes for locking (S3 object versioning must be enabled on the state bucket). The older `dynamodb_table` locking approach is deprecated in Terraform 1.7+.
 
 ---
 
-## GitHub secrets to configure
+## GitHub Actions
 
-Go to GitHub → repo → Settings → Secrets and variables → Actions → New secret.
+### `.github/workflows/ci.yml` — Lint + Test
+
+Triggers on pull requests to `main`. Steps:
+1. Checkout + set up Python 3.11
+2. `pip install -e ".[dev]"`
+3. `ruff check .`
+4. `pytest -q --ignore=tests/test_streaming.py --ignore=tests/test_smoke.py`
+
+`test_streaming.py` and `test_smoke.py` are excluded — they require a running Flink or Docker environment that's not available in the GitHub-hosted runner.
+
+Docker Compose build check: `docker compose build --no-cache` validates that all Dockerfiles build cleanly without launching services.
+
+### `.github/workflows/deploy.yml` — Deploy on merge
+
+Triggers on push to `main`. Two jobs:
+
+**`terraform` job:**
+1. `aws-actions/configure-aws-credentials` — OIDC exchange, no stored keys
+2. `hashicorp/setup-terraform`
+3. `terraform init` with backend config from secrets
+4. `terraform plan` — shows what will change
+5. `terraform apply -auto-approve` — provisions/updates infra
+
+**`deploy` job** (depends on `terraform`):
+1. Fetch EC2 public IP from `terraform output -raw ec2_public_ip`
+2. SSH in using `EC2_SSH_PRIVATE_KEY` secret (the `.pem` contents)
+3. `git pull origin main` on the EC2
+4. `docker compose pull && docker compose up -d --build`
+
+---
+
+## OIDC — zero stored credentials
+
+GitHub Actions authenticates to AWS via OIDC:
+1. GitHub generates a short-lived JWT for the workflow run
+2. AWS STS exchanges it for temporary credentials via the configured OIDC identity provider
+3. The assumed role (`veloshelf-github-deploy`) has EC2/RDS/S3/IAM permissions scoped to the VeloShelf resources
+
+Trust policy restricts assumption to `repo:Anand09-in/veloshelf:*` — no other repo can assume this role even if it has the role ARN. Credentials expire after the workflow run; nothing is stored.
+
+---
+
+## GitHub secrets required
 
 | Secret | Value |
 |---|---|
-| `AWS_DEPLOY_ROLE_ARN` | ARN of the IAM role GitHub Actions assumes via OIDC |
-| `TF_STATE_BUCKET` | Name of your Terraform state S3 bucket |
-| `TF_LOCK_TABLE` | Name of your DynamoDB lock table |
-| `S3_SUFFIX` | Unique suffix for VeloShelf S3 bucket names |
-| `EC2_KEY_NAME` | Name of the EC2 key pair in AWS (without .pem) |
-| `EC2_SSH_PRIVATE_KEY` | Contents of the .pem file (for SSH deploy job) |
-| `DB_PASSWORD` | RDS Postgres password |
+| `AWS_DEPLOY_ROLE_ARN` | ARN of `veloshelf-github-deploy` IAM role |
+| `TF_STATE_BUCKET` | `veloshelf-tfstate-798644229089` |
+| `S3_SUFFIX` | `798644229089` (AWS account ID) |
+| `EC2_KEY_NAME` | `veloshelf-key` |
+| `EC2_SSH_PRIVATE_KEY` | Contents of `veloshelf-key.pem` |
+| `DB_PASSWORD` | RDS Postgres master password |
 
 ---
 
-## OIDC setup (one-time, ~5 minutes)
+## Makefile — cost control targets
 
-OIDC lets GitHub Actions authenticate to AWS without storing any long-lived
-credentials. This is the production-standard approach.
-
-```bash
-# 1. Create the OIDC identity provider in AWS (one-time per account)
-aws iam create-open-id-connect-provider \
-  --url https://token.actions.githubusercontent.com \
-  --client-id-list sts.amazonaws.com \
-  --thumbprint-list 6938fd4d98bab03faadb97b34396831e3780aea1
-
-# 2. Create IAM role for GitHub Actions
-# Replace YOUR_GITHUB_ORG and YOUR_REPO_NAME
-cat > trust-policy.json << 'EOF'
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Principal": {
-      "Federated": "arn:aws:iam::ACCOUNT_ID:oidc-provider/token.actions.githubusercontent.com"
-    },
-    "Action": "sts:AssumeRoleWithWebIdentity",
-    "Condition": {
-      "StringEquals": {
-        "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
-      },
-      "StringLike": {
-        "token.actions.githubusercontent.com:sub": "repo:Anand09-in/veloshelf:*"
-      }
-    }
-  }]
-}
-EOF
-
-aws iam create-role \
-  --role-name veloshelf-github-deploy \
-  --assume-role-policy-document file://trust-policy.json
-
-# 3. Attach policies the role needs
-aws iam attach-role-policy \
-  --role-name veloshelf-github-deploy \
-  --policy-arn arn:aws:iam::aws:policy/AmazonEC2FullAccess
-
-aws iam attach-role-policy \
-  --role-name veloshelf-github-deploy \
-  --policy-arn arn:aws:iam::aws:policy/AmazonRDSFullAccess
-
-aws iam attach-role-policy \
-  --role-name veloshelf-github-deploy \
-  --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess
-
-aws iam attach-role-policy \
-  --role-name veloshelf-github-deploy \
-  --policy-arn arn:aws:iam::aws:policy/IAMFullAccess
-
-# 4. Copy the role ARN → set as AWS_DEPLOY_ROLE_ARN secret in GitHub
-aws iam get-role --role-name veloshelf-github-deploy \
-  --query 'Role.Arn' --output text
+```makefile
+make infra-up     # terraform apply — provision or update all AWS resources
+make infra-down   # terraform destroy — tear down everything (5s countdown)
+make ec2-stop     # stop the EC2 instance (~$0.10/hr saved while idle)
+make ec2-start    # start the EC2 instance
+make ec2-ssh      # SSH into EC2: ssh -i veloshelf-key.pem ec2-user@<ip>
 ```
 
----
+`EC2_INSTANCE` is resolved at make-time via `terraform output -raw ec2_public_ip`. `INSTANCE_ID` is resolved via `aws ec2 describe-instances --filters "Name=ip-address,Values=<ip>"`.
 
-## Terraform state backend setup (one-time)
-
-```bash
-# 1. Create the state bucket (replace <suffix> with your S3_SUFFIX)
-aws s3 mb s3://veloshelf-tfstate-<suffix> --region ap-south-1
-
-# Enable versioning (recover from accidental state corruption)
-aws s3api put-bucket-versioning \
-  --bucket veloshelf-tfstate-<suffix> \
-  --versioning-configuration Status=Enabled
-
-# 2. Create DynamoDB lock table
-aws dynamodb create-table \
-  --table-name veloshelf-tfstate-lock \
-  --attribute-definitions AttributeName=LockID,AttributeType=S \
-  --key-schema AttributeName=LockID,KeyType=HASH \
-  --billing-mode PAY_PER_REQUEST \
-  --region ap-south-1
-
-# 3. Run terraform init
-cd infra
-terraform init \
-  -backend-config="bucket=veloshelf-tfstate-<suffix>" \
-  -backend-config="key=veloshelf/terraform.tfstate" \
-  -backend-config="region=ap-south-1" \
-  -backend-config="dynamodb_table=veloshelf-tfstate-lock" \
-  -backend-config="encrypt=true"
-```
+Stopping the EC2 while not demoing reduces running cost from ~$85/mo to ~$12/mo (only RDS storage is billed when EC2 is stopped).
 
 ---
 
 ## Interview talking points
 
-**Why OIDC instead of stored AWS keys?**
-Long-lived credentials stored as GitHub secrets are a security risk —
-they don't expire and a secret leak means permanent AWS access. OIDC
-issues short-lived tokens per-workflow via AWS STS. Zero credentials
-to rotate or accidentally commit.
+**"Why OIDC over stored access keys?"**
+Long-lived credentials stored as GitHub secrets are a security risk — they don't expire, and a secret leak means permanent AWS access. OIDC issues short-lived STS tokens scoped to a single workflow run. Nothing to rotate, nothing to accidentally commit.
 
-**Why S3 remote state with DynamoDB locking?**
-Local state breaks in a team or CI environment — two concurrent applies
-corrupt the state file. S3 + DynamoDB gives atomic locking, versioning
-(recover from bad applies), and shared state accessible to any runner.
+**"Why S3 backend with `use_lockfile`?"**
+Local `terraform.tfstate` breaks in any multi-person or CI environment — two concurrent applies corrupt the file. S3 + native locking gives atomic state updates, versioning for rollback, and shared state accessible to any runner or developer. `use_lockfile` is the modern approach replacing the older DynamoDB locking table.
 
-**Why not EKS in production now?**
-Cost and complexity for a demo don't justify it. The architecture is
-*designed* for EKS (manifests committed, Terraform module written) —
-showing that "I'd scale this to Kubernetes" is defensible, and "I
-didn't waste $72/month running EKS for a portfolio piece" shows
-engineering judgment.
+**"Why not EKS?"**
+$72/month minimum for a 3-node EKS cluster, for a portfolio demo. The Terraform module for EKS and the k8s manifests are committed (`infra/modules/eks/`, `k8s/`) — the design intent is there. Running on a single EC2 with Docker Compose costs nothing and demonstrates the same architectural thinking without the spend.
 
-**Why RDS instead of Postgres in Docker?**
-Container storage is ephemeral — a restart loses the serving store.
-RDS gives durability, automated backups, and security group isolation.
-At t3.micro it's free-tier eligible and costs nothing during the demo.
-
----
-
-## Cost summary (AWS)
-
-| Resource | Spec | Monthly est. |
-|---|---|---|
-| EC2 t3.small | Stop when not demoing | ~$0 free tier / ~$15 if always-on |
-| RDS t3.micro Postgres | 20GB gp2 | ~$0 free tier (first 12 months) |
-| S3 features + MLflow | < 1GB | < $0.03 |
-| DynamoDB (TF lock) | Pay per request | < $0.01 |
-| **Total** | | **~$0 free tier** |
-
-Stop the EC2 when not demoing: `aws ec2 stop-instances --instance-ids <id>`
+**"Why RDS instead of Postgres in Docker on EC2?"**
+Docker container storage is ephemeral — an EC2 restart or `docker compose down` with a volume prune loses the entire serving store and alert history. RDS gives durable storage, automated parameter management, and security group isolation. At db.t3.micro it's free-tier eligible for the first 12 months.

@@ -1,250 +1,66 @@
-# VeloShelf — Real-Time Quick-Commerce Intelligence Pipeline
+# VeloShelf — System Overview
 
-> A production-grade streaming data platform for a Blinkit/Zepto-style dark-store business:
-> ingest live order & inventory events, compute windowed features in real time, detect
-> **stockouts** and **demand surges**, forecast short-horizon demand, and run the whole thing
-> with real data observability, drift detection, and a closed-loop retraining story —
-> all inside the AWS Free Tier.
+A production-grade streaming ML platform for quick-commerce dark stores. Order and inventory events flow through Kafka → PyFlink → Postgres in real time; windowed features drive anomaly detection (Isolation Forest) and demand forecasting (XGBoost); Evidently monitors for drift and triggers automated closed-loop retraining via Dagster; the whole stack is provisioned on AWS with Terraform and deployed through GitHub Actions.
 
 ---
 
-## 1. Project Goal
+## Architecture
 
-**One-line pitch:** An end-to-end real-time data engineering + streaming-ML platform for quick-commerce dark stores that turns a firehose of order/inventory events into live operational intelligence (stockout risk, demand surges) with production-grade observability and automated model retraining.
-
-**Why this domain:** Quick-commerce (10-minute grocery delivery) is defined by velocity — orders fire every second, inventory depletes in real time, demand spikes without warning (rain, weekends, festivals). The domain's fast-moving nature is expressed *directly in the engineering*: windowed stream processing, event-time handling, freshness SLAs, and real-time alerting. This is not a nightly batch warehouse wearing a quick-commerce label; the pipeline is streaming because the business is streaming.
-
-**What it demonstrates (resume narrative):**
-- End-to-end ownership of a **real-time** streaming pipeline (ingestion → processing → serving)
-- **Streaming ML** lifecycle: online scoring + offline training + model registry + hot-swap
-- **Production observability**: freshness/volume/schema/distribution monitoring
-- **Data drift detection** (PSI/KS/JS) and **model evaluation** over time
-- **Closed-loop MLOps**: drift-triggered retraining with validation gates
-- **Cost engineering**: real streaming on a single EC2 inside the AWS Free Tier
-- **IaC + CI/CD**: Terraform-provisioned infra, GitHub Actions with OIDC
-
-**Portfolio positioning:** This is the **streaming + streaming-ML + observability** project. Its sibling, **UrbanPulse** (NYC taxi), is the **batch / dimensional-modeling / dbt** project. Together they form a clean, non-overlapping spread: batch and streaming, both with strong modeling and testing discipline.
+```
+Generator (Poisson + Zipf + anomaly injection)
+    │
+    ▼  raw-orders / raw-inventory
+Kafka 3.8 (KRaft, 3 partitions)
+    │
+    ▼
+PyFlink 1.18 (event-time tumbling 1-min windows)
+    │  validation → dead-letter topic
+    │  windowed features (order_rate, depletion_vel, demand_momentum, on_hand_est)
+    ▼
+Postgres 16 — windowed_features + alerts tables
+    │
+    ├── Online scorer (Flink FeatureSinkFn) ─── MLflow registry (hot-swap, 5-min poll)
+    │       └── stockout-alerts / surge-alerts → Kafka topics
+    │
+    ├── Metrics exporter ──► Prometheus ──► Grafana (auto-provisioned dashboard)
+    │
+    ├── Streamlit (business dashboard — stockout risk, surge alerts, velocity)
+    │
+    └── Dagster asset graph
+            ├── windowed_features_parquet (Parquet export)
+            ├── detector_training_run → detector_promotion      (6h schedule)
+            ├── forecaster_training_run → forecaster_promotion  (6h+30m schedule)
+            ├── drift_report (Evidently, 2h schedule)
+            └── drift_retrain_sensor → retrain jobs (PSI > 0.25 threshold + cooldown)
+```
 
 ---
 
-## 2. Scope Decisions (locked)
+## Tech Stack
 
-These were decided deliberately; each is defensible in an interview.
-
-| Decision | Choice | Rationale |
+| Layer | Technology | Notes |
 |---|---|---|
-| Domain | Quick-commerce (Blinkit/Zepto grocery) | Velocity is native to the domain; interviewers in India get it instantly |
-| Detection targets | **Both** stockout + demand surge | Two business-meaningful outputs from the same windowed features |
-| Data source | **Synthetic event generator** | Full control of distributions → can demo anomalies on demand + have ground-truth labels |
-| Streaming backbone | **Kafka on a single EC2** | Reuses skills, keeps the Kafka keyword, free-tier friendly |
-| Stream processing | **PyFlink** windowed features | Real event-time windowing; carries the Flink keyword |
-| Offline training | **Spark + MLflow** | Batch training, model registry, hot-swap |
-| Compute scope | **Single-EC2 "done"** | EKS manifests committed but not run → cost-conscious, still shows k8s design |
-| Dashboards | **Grafana** (live health) + **Streamlit** (business view) | Grafana for time-series ops; Streamlit for bespoke business tables |
-| Observability | **Evidently first**, Great Expectations later | Drift/eval is the differentiator; ship it before table-stakes quality assertions |
-| Retraining | **Scheduled** drift-triggered retrain w/ validation gate + cooldown | Closed MLOps loop, but scheduled (not always-on) for cost/simplicity |
-| Orchestration | **Dagster** (asset-oriented) | Fresher keyword than Airflow (already on UrbanPulse); asset model fits the ML pipeline; models the conditional retrain as a real dependency graph |
-| Serving store | **Redis vs. Postgres — open** | Decide before Phase 2; hinges on how tabular/SQL-driven the dashboard views are |
-
-**On EKS / Kubernetes:** Not a core data-engineering gate — it's a "nice to have" keyword, far more central to ML-platform/MLOps roles. The plan **designs for EKS** (commits k8s manifests + a Terraform EKS module) but **runs on a single EC2** for cost. "Designed for EKS, ran on a single node to stay in free tier" is a strong, cost-conscious interview answer.
-
----
-
-## 3. Architecture
-
-### 3.1 High-level flow
-
-```
-┌──────────────────────┐
-│  Synthetic Event Gen │  Poisson arrivals + time-of-day/weekend surges,
-│  (Python producer)   │  per-SKU popularity, injected anomalies (ground truth)
-└──────────┬───────────┘
-           │ order & inventory events
-           ▼
-┌──────────────────────┐
-│   Kafka (single EC2) │  topics: raw-orders, raw-inventory,
-│                      │  features-windowed, stockout-alerts, surge-alerts, dead-letter
-└──────────┬───────────┘
-           │
-           ▼
-┌──────────────────────┐
-│   PyFlink job        │  event-time tumbling/sliding windows
-│                      │  → order rate, depletion velocity, demand momentum,
-│                      │    basket size, per-SKU/-store volume
-│                      │  → schema/range validation → dead-letter on failure
-└─────┬────────────┬───┘
-      │            │
-      │ features   │ alerts (stockout + surge)
-      ▼            ▼
-┌───────────┐  ┌──────────────────┐
-│    S3     │  │  Serving store    │  (Redis or Postgres:
-│ raw +     │  │  latest window    │   latest per-SKU state,
-│ features  │  │  state + alerts)  │   active alerts)
-│ (parquet) │  └─────┬────────────┬─┘
-└─────┬─────┘        │            │
-      │              ▼            ▼
-      │        ┌──────────┐  ┌──────────────┐
-      │        │ Grafana  │  │  Streamlit    │
-      │        │ (live    │  │  (business    │
-      │        │  health) │  │   dashboard)  │
-      │        └────▲─────┘  └──────────────┘
-      │             │ metrics
-      │        ┌────┴─────┐
-      │        │Prometheus│ ◄── freshness lag, volume, feature stats,
-      │        └──────────┘     PSI gauges, alert counts
-      │
-      ▼
-┌────────────────────────────────────────────┐
-│  Batch layer (scheduled: Dagster)           │
-│  ┌─────────────┐   ┌──────────────────────┐ │
-│  │ Spark train │   │ Evidently drift + eval│ │
-│  │ forecast +  │   │ PSI/KS/JS, MAE/RMSE,  │ │
-│  │ anomaly mdl │   │ precision/recall      │ │
-│  └──────┬──────┘   └──────────┬───────────┘ │
-│         │                     │             │
-│         ▼                     ▼             │
-│   ┌──────────┐         drift/error breach?  │
-│   │  MLflow  │◄────── retrain trigger ──────┘
-│   │ registry │        (validation gate + cooldown)
-│   └────┬─────┘
-│        │ promote best model
-│        ▼
-│   hot-swap into online scoring
-└────────────────────────────────────────────┘
-```
-
-### 3.2 Layer responsibilities
-
-**Ingestion (synthetic generator).** A Python producer emits realistic `order` and `inventory_movement` events. Arrival modeled as a time-varying Poisson process with time-of-day and weekend multipliers; per-SKU demand from a long-tail (Zipf-ish) popularity distribution; per-dark-store partitioning. Anomalies are *injected deliberately* (sudden demand spikes on specific SKUs, accelerated depletion) and **logged as ground-truth labels** — this is the key advantage of synthetic data: you can report real detection precision/recall, which scraped/live data can't give you.
-
-**Streaming backbone (Kafka on EC2).** Single-broker Kafka. Topics carry raw events, windowed features, the two alert streams, and a **dead-letter topic** for malformed/failed-validation events (a maturity signal most demos skip).
-
-**Stream processing (PyFlink).** Event-time tumbling (e.g. 1-min) and sliding (e.g. 5-min/1-min slide) windows compute:
-- `order_rate` per SKU / category / store per window
-- `depletion_velocity` (units/min) per SKU
-- `demand_momentum` (short vs. longer window rate ratio)
-- `basket_size` distribution
-- per-store `volume_imbalance`
-
-Inline schema + range validation; failures → dead-letter. Outputs windowed features (to S3 + serving store) and evaluates the current online model to emit **stockout** and **surge** alerts.
-
-**Serving store.** Redis (fast, simple) or Postgres holds latest-per-SKU state and active alerts for the dashboards to read.
-
-**Storage (S3).** Raw events and windowed features land as partitioned Parquet (date/hour) — the reference + current windows for drift analysis and the training corpus.
-
-**Batch layer (scheduled).** Two scheduled jobs:
-1. **Spark + MLflow training** — trains the demand forecaster and the anomaly/surge model on historical features; logs metrics + registers models.
-2. **Evidently drift + evaluation** — PSI/KS/JS on recent vs. reference window; model metrics (MAE/RMSE/MAPE for the forecaster; precision/recall/F1 for the detector against injected labels). Drift report HTML → S3; key metrics → MLflow + mirrored as Prometheus gauges.
-
-**Closed-loop retraining.** Drift threshold breach (e.g. PSI > 0.25) **or** error degradation (e.g. MAE beyond bound) → retrain → **validate against holdout** → promote in MLflow **only if it beats the incumbent** → online scorer hot-swaps. Guardrails: validation gate (drift ≠ better model) and a **cooldown / rate-limit** (no retrain storms).
-
-**Observability.**
-- *Data quality:* in-stream dead-letter quarantine now; Great Expectations in the warehouse layer later.
-- *Live health:* Prometheus scrapes freshness lag, volume, per-window feature stats, alert counts → Grafana.
-- *Drift/eval:* Evidently reports (S3) + metrics in MLflow + PSI gauges surfaced on Grafana.
-
-### 3.3 Observability & evaluation vocabulary (keep these crisp)
-
-- **Data quality testing** — explicit rules (non-null, unique, ranges, referential integrity).
-- **Data observability** — the five pillars: freshness, volume, schema, distribution, lineage.
-- **Data drift** — distributional change: *feature drift* (PSI, KS, Chi-square, JS, Wasserstein), *concept drift* (feature→target relationship changes), *prediction drift* (output distribution shifts).
-- **Model monitoring** — performance over time (MAE/RMSE/MAPE; precision/recall/F1), tracked across versions in MLflow.
-
-*PSI rule of thumb:* < 0.1 stable · 0.1–0.25 moderate shift · > 0.25 significant shift.
+| Event streaming | Apache Kafka 3.8 | KRaft mode (no ZooKeeper), dual listeners (EXTERNAL/INTERNAL) |
+| Stream processing | PyFlink 1.18 | Event-time tumbling windows, watermarks, dead-letter quarantine |
+| Serving store | Postgres 16 | `windowed_features` + `alerts` tables; RDS on AWS |
+| Anomaly detection | Isolation Forest (scikit-learn) | Trained on normal windows; scores per event |
+| Demand forecasting | XGBoost | Lag features, z-scores, time-of-day; MAE-optimised |
+| Experiment tracking | MLflow 3.1 | Model registry with `Production` alias, artifact store |
+| Drift detection | Evidently | PSI + KS statistic + Jensen-Shannon divergence |
+| Orchestration | Dagster 1.9 | Asset graph, 3 schedules, drift-retrain sensor |
+| Metrics | Prometheus + Grafana 10 | Auto-provisioned dashboard from JSON |
+| Business dashboard | Streamlit | Reads live Postgres state |
+| IaC | Terraform 1.7 | Modules: networking, ec2, rds, s3 |
+| CI/CD | GitHub Actions | OIDC (zero stored credentials), SSH deploy on merge |
+| Containerisation | Docker Compose | 12 services; single EC2 on AWS |
 
 ---
 
-## 4. Tech Stack
+## Data Flow
 
-| Concern | Tool |
-|---|---|
-| Language | Python (+ SQL) |
-| Streaming backbone | Apache Kafka (single EC2) |
-| Stream processing | PyFlink (event-time windows) |
-| Batch training | Apache Spark |
-| ML tracking / registry | MLflow |
-| Drift / evaluation | Evidently (Great Expectations later) |
-| Serving store | Redis or Postgres |
-| Object storage | AWS S3 (Parquet) |
-| Metrics | Prometheus |
-| Dashboards | Grafana (ops) + Streamlit (business) |
-| Orchestration | Dagster (asset-oriented; scheduled batch jobs) |
-| IaC | Terraform |
-| CI/CD | GitHub Actions + OIDC |
-| Containerization | Docker (k8s manifests committed, not run) |
+### Event schemas
 
----
-
-## 5. Repository Structure
-
-```
-veloshelf/
-├── README.md
-├── docs/
-│   ├── architecture.md            # this spec, trimmed
-│   ├── observability.md           # drift/eval design + PSI thresholds
-│   └── cost.md                    # free-tier cost math
-├── generator/                     # synthetic event producer
-│   ├── producer.py
-│   ├── distributions.py           # Poisson arrivals, Zipf SKU popularity
-│   ├── anomaly_injector.py        # injects + logs ground-truth labels
-│   └── schemas.py                 # event schemas (order, inventory)
-├── streaming/                     # PyFlink job
-│   ├── job.py                     # main Flink pipeline
-│   ├── windows.py                 # windowed feature definitions
-│   ├── validation.py              # schema/range checks → dead-letter
-│   ├── scoring.py                 # online model eval → alerts
-│   └── sinks.py                   # S3 + serving-store writers
-├── ml/
-│   ├── train_forecast.py          # Spark demand forecaster + MLflow
-│   ├── train_detector.py          # anomaly/surge model + MLflow
-│   ├── evaluate.py                # MAE/RMSE, precision/recall vs. labels
-│   ├── promote.py                 # validation gate + registry promotion
-│   └── features.py                # shared feature logic (online/offline parity)
-├── observability/
-│   ├── drift_job.py               # Evidently: PSI/KS/JS, report → S3
-│   ├── retrain_trigger.py         # threshold check + cooldown → trigger
-│   ├── metrics_exporter.py        # push gauges to Prometheus
-│   └── prometheus/                # scrape config, rules
-├── serving/
-│   ├── streamlit_app.py           # business dashboard
-│   └── grafana/                   # dashboard JSON, provisioning
-├── infra/                         # Terraform
-│   ├── main.tf
-│   ├── ec2.tf                     # Kafka/Flink host
-│   ├── s3.tf
-│   ├── iam.tf                     # OIDC roles
-│   ├── eks.tf                     # committed, NOT applied (design intent)
-│   └── variables.tf
-├── k8s/                           # manifests (design intent, not run)
-│   ├── kafka.yaml
-│   ├── flink.yaml
-│   └── streamlit.yaml
-├── orchestration/
-│   ├── definitions.py             # Dagster Definitions (assets, jobs, schedules)
-│   ├── assets.py                  # data/model assets (features → model → eval)
-│   └── schedules.py               # scheduled runs for train/drift/retrain
-├── tests/
-│   ├── test_generator.py
-│   ├── test_windows.py
-│   ├── test_validation.py
-│   └── test_evaluate.py
-├── .github/workflows/
-│   ├── ci.yml                     # lint, test
-│   └── deploy.yml                 # OIDC → Terraform
-├── docker-compose.yml             # local full-stack run
-├── Makefile
-├── pyproject.toml
-└── requirements.txt
-```
-
----
-
-## 6. Data Model
-
-### 6.1 Event schemas
-
-**Order event**
+**Order event** — emitted by the generator on every synthetic sale:
 ```json
 {
   "event_id": "uuid",
@@ -259,7 +75,7 @@ veloshelf/
 }
 ```
 
-**Inventory movement event**
+**Inventory movement event** — emitted alongside each order:
 ```json
 {
   "event_id": "uuid",
@@ -273,107 +89,156 @@ veloshelf/
 }
 ```
 
-### 6.2 Windowed feature record (Flink output)
+### Windowed feature record (Flink output → Postgres)
 ```
 store_id, sku_id, category, window_start, window_end,
 order_rate, depletion_velocity, demand_momentum,
-avg_basket_size, on_hand_estimate, volume_imbalance
+avg_basket_size, on_hand_est, volume_imbalance
 ```
 
-### 6.3 Reference dimensions (for context / joins)
-- `dim_sku` — sku_id, name, category, unit_price, reorder_point
-- `dim_store` — store_id, region, capacity
+### Reference dimensions
+- `data/seeds/dim_sku.csv` — sku_id, name, category, unit_price, reorder_point (500 SKUs)
+- `data/seeds/dim_store.csv` — store_id, region, capacity (3 dark stores)
 
 ---
 
-## 7. Build Plan (phased)
+## AWS Deployment
 
-Sequenced so you always have a runnable slice. Target: **3–4 weekends**.
-
-### Phase 0 — Foundations (½ weekend)
-- Repo scaffold, `pyproject.toml`, Makefile, `docker-compose.yml`
-- Event schemas + `dim_sku` / `dim_store` seed data
-- **Done when:** `docker-compose up` brings up Kafka + Redis + local MLflow.
-
-### Phase 1 — Ingestion (½ weekend)
-- Synthetic generator: Poisson arrivals, Zipf SKU popularity, time-of-day/weekend surges
-- Anomaly injector writing ground-truth labels
-- Producer → `raw-orders` / `raw-inventory`
-- **Done when:** events flow into Kafka; labels persisted; `test_generator` passes.
-
-### Phase 2 — Stream processing (1 weekend)
-- PyFlink job: event-time windows → the 5 feature families
-- Inline validation → dead-letter topic
-- Sinks: features → S3 (Parquet) + serving store
-- **Done when:** windowed features land in S3 & Redis; bad events quarantined; `test_windows` + `test_validation` pass.
-
-### Phase 3 — ML layer (1 weekend)
-- Spark training: demand forecaster + anomaly/surge detector
-- MLflow tracking + registry; online scorer reads current model → emits stockout/surge alerts
-- Evaluation: MAE/RMSE + precision/recall vs. injected labels
-- **Done when:** alerts appear on their topics; models registered; metrics logged.
-
-### Phase 4 — Observability (½–1 weekend)
-- Prometheus exporters: freshness lag, volume, feature stats, alert counts
-- Grafana dashboards (live health)
-- Evidently drift job: PSI/KS/JS → report to S3 + metrics to MLflow + PSI gauges to Prometheus
-- Streamlit business dashboard (low-stock/stockout-risk SKUs, active surge alerts, category velocity)
-- **Done when:** Grafana shows live health; Evidently report generates; Streamlit reads live state.
-
-### Phase 5 — Closed-loop retraining (½ weekend)
-- `retrain_trigger`: threshold check (PSI / MAE) + cooldown
-- `promote`: retrain → holdout validation gate → promote only if better → hot-swap
-- Scheduled via Dagster (asset-based job with a schedule; conditional retrain step)
-- **Done when:** an injected drift event triggers a retrain that promotes only on improvement.
-
-### Phase 6 — IaC, CI/CD, polish (½–1 weekend)
-- Terraform: EC2, S3, IAM/OIDC (+ committed-but-unapplied `eks.tf` and `k8s/`)
-- GitHub Actions: CI (lint/test) + deploy (OIDC → Terraform)
-- README with architecture diagram, screenshots, cost notes, "production evolution" section
-- **Done when:** clean clone → documented path to run; CI green.
-
-### Later (only if project succeeds)
-- Great Expectations quality suite in the warehouse layer
-- Event-driven (always-on) retrain trigger
-- Actually run EKS
-
----
-
-## 8. Free-Tier Cost Math
-
-| Resource | Plan | Est. cost |
+| Resource | Spec | Purpose |
 |---|---|---|
-| EC2 (Kafka + Flink + Streamlit) | 1× t3.small (or t3.micro if tight); stop when idle | Free-tier hours / a few $ |
-| S3 | Parquet features + drift reports; lifecycle-expire raw | < $1 |
-| MLflow | On the same EC2 (SQLite/local backend) | $0 |
-| Prometheus + Grafana | Containers on same EC2 | $0 |
-| EKS | **Not run** (manifests only) | $0 |
-| Dagster (on same EC2) | Runs alongside stack; stop when idle | ~$0 |
-| Data transfer | Minimal (synthetic, self-contained) | ~$0 |
+| EC2 m7i-flex.large | ap-south-1 | Runs all 12 Docker containers |
+| RDS db.t3.micro | Postgres 16, 20GB gp2 | Durable serving store and alert log |
+| S3 veloshelf-features-* | — | Parquet feature exports for training |
+| S3 veloshelf-mlflow-* | — | MLflow artifact store |
+| VPC | 10.0.0.0/16, 2 public subnets | Networking isolation |
 
-**Guardrails:** stop the EC2 when not demoing; S3 lifecycle rule to expire raw events; no NAT Gateway; no MSK/Kinesis; no always-on EKS. **Keep the $200 credits essentially untouched.**
+Security groups allow inbound on: 22 (SSH), 9092 (Kafka), 5432 (Postgres), 5000 (MLflow), 3000 (Dagster), 3001 (Grafana), 8080–8081 (Kafka UI / Flink UI), 8000 (metrics), 8501 (Streamlit), 9090 (Prometheus).
 
----
+### Local service URLs
 
-## 9. Resume Bullets (draft — tighten after build)
-
-- Built a real-time quick-commerce intelligence platform ingesting synthetic order/inventory events through **Kafka → PyFlink** event-time windows, detecting **stockouts and demand surges** with sub-minute freshness.
-- Implemented a **streaming-ML lifecycle** — online scoring, Spark offline training, MLflow registry, and drift-triggered **hot-swap retraining** with a holdout validation gate.
-- Engineered production **observability**: freshness/volume/feature monitoring via **Prometheus + Grafana**, and **data-drift detection** (PSI/KS/JS) with **Evidently**, reporting real detection precision/recall against injected ground-truth anomalies.
-- Provisioned all infra with **Terraform** and **GitHub Actions OIDC** CI/CD; ran real streaming inside the **AWS Free Tier** by designing for EKS but deploying single-node for cost.
-
----
-
-## 10. Interview Talking Points (anticipated Q&A)
-
-- **"Why synthetic data?"** Full control of distributions to demo anomalies on demand, *and* ground-truth labels → real precision/recall, which live data can't give.
-- **"Why not MSK/Kinesis?"** Cost. Single-broker Kafka on EC2 gives the same semantics inside free tier; MSK would burn credits for no learning value.
-- **"How do you detect drift?"** PSI as primary (thresholds 0.1/0.25), KS for continuous, JS/Chi-square as needed, via Evidently on recent-vs-reference windows.
-- **"Isn't auto-retraining dangerous?"** Two guardrails: a holdout **validation gate** (drift ≠ better model — never promote without beating the incumbent) and a **cooldown** to prevent retrain storms.
-- **"Why Dagster over Airflow?"** Asset-oriented model maps cleanly to an ML pipeline (features → model → eval as assets), the conditional retrain becomes a real dependency graph, and it's a current keyword I didn't already have (UrbanPulse already shows Airflow) — chosen deliberately, not by default.
-- **"Why single-EC2 not EKS?"** Cost-conscious choice; designed for EKS (manifests + Terraform module committed), ran single-node — demonstrates I can right-size infra to the problem.
-- **"How is this different from your batch project?"** UrbanPulse is batch/dimensional-modeling; this is streaming + streaming-ML + observability. Complementary, non-overlapping.
+| Service | URL | Credentials |
+|---|---|---|
+| Flink UI | http://localhost:8081 | — |
+| Kafka UI | http://localhost:8080 | — |
+| MLflow | http://localhost:5000 | — |
+| Dagster | http://localhost:3000 | — |
+| Grafana | http://localhost:3001 | admin / veloshelf |
+| Streamlit | http://localhost:8501 | — |
+| Prometheus | http://localhost:9090 | — |
 
 ---
 
-*Spec complete. Ready to start at Phase 0.*
+## Repository Layout
+
+```
+veloshelf/
+├── generator/              # Synthetic event producer
+│   ├── producer.py         # Entry point: python -m generator.producer --mode fast
+│   ├── distributions.py    # Poisson arrivals, Zipf SKU popularity, time-of-day surges
+│   ├── anomaly_injector.py # Injects + logs ground-truth labels → data/seeds/anomaly_labels.jsonl
+│   └── schemas.py          # Pydantic event models (OrderEvent, InventoryMovementEvent)
+├── streaming/
+│   ├── job.py              # PyFlink pipeline: source → validate → window → score → sink
+│   ├── validation.py       # Schema + range checks, dead-letter envelope
+│   ├── scoring.py          # Rule-based stockout/surge scorer + ML hot-swap integration
+│   └── sinks.py            # PostgresSink (upsert features + insert alerts), KafkaAlertSink
+├── ml/
+│   ├── export_features.py  # Dumps windowed_features from Postgres → data/features/features.parquet
+│   ├── train_detector.py   # Isolation Forest training + MLflow logging + promotion
+│   ├── train_forecast.py   # XGBoost forecaster training + MLflow logging + promotion
+│   ├── features.py         # Shared feature engineering (lags, z-scores) — online/offline parity
+│   ├── evaluate.py         # ForecastEvaluator (MAE/RMSE/MAPE) + DetectorEvaluator (P/R/F1)
+│   ├── promote.py          # Validation gate + cooldown + MLflow registry promotion
+│   └── model_loader.py     # HotSwapModelLoader — polls MLflow registry every 5 min
+├── orchestration/
+│   ├── definitions.py      # Dagster Definitions (all assets, jobs, schedules, sensor)
+│   ├── assets.py           # 5 assets: features parquet, detector/forecaster train+promote, drift
+│   ├── schedules.py        # detector_retrain (6h), forecaster_retrain (6h+30m), drift_check (2h)
+│   └── sensors.py          # drift_retrain_sensor — watches drift_report, triggers retrain jobs
+├── observability/
+│   ├── drift_job.py        # Evidently: PSI/KS/JS per feature, HTML report → data/reports/
+│   ├── retrain_trigger.py  # Threshold check + cooldown sentinel (.retrain_cooldowns/)
+│   ├── metrics_exporter.py # Prometheus gauges: freshness lag, drift PSI, MAE/F1, alert counts
+│   └── prometheus/
+│       ├── prometheus.yml  # Scrape config
+│       └── alerts.yml      # Alerting rules
+├── serving/
+│   ├── streamlit_app.py    # Business dashboard: stockout risk, surge alerts, category velocity
+│   └── grafana/
+│       ├── datasource.yml  # Prometheus datasource (auto-provisioned)
+│       ├── dashboard.yml   # Dashboard provider config (auto-provisioned)
+│       └── veloshelf_dashboard.json  # 4-section dashboard JSON
+├── infra/
+│   ├── main.tf             # Root module wiring networking + ec2 + rds + s3
+│   ├── variables.tf
+│   ├── terraform.tfvars.example
+│   └── modules/
+│       ├── networking/     # VPC, public subnets, IGW, route tables
+│       ├── ec2/            # Instance, IAM role + S3 policy, security group, user_data bootstrap
+│       ├── rds/            # Postgres 16, db subnet group, SG (ingress from VPC CIDR)
+│       └── s3/             # Features bucket + MLflow artifact bucket
+├── .github/workflows/
+│   ├── ci.yml              # Lint + test on every PR; docker compose build check
+│   └── deploy.yml          # OIDC → terraform apply → SSH docker-compose up
+├── data/
+│   ├── seeds/              # dim_sku.csv, dim_store.csv, anomaly_labels.jsonl
+│   ├── features/           # Local Parquet (training input when not using S3)
+│   └── reports/            # Evidently HTML drift reports
+├── docker-compose.yml      # Full local stack (12 services)
+├── Makefile                # up, down, initdb, topics, flink-submit, train, infra-up, ec2-stop, …
+└── pyproject.toml
+```
+
+---
+
+## Key Design Decisions
+
+**Serving store: Postgres (not Redis)**
+Postgres handles windowed feature upserts well via `ON CONFLICT DO UPDATE`. It also stores alerts with timestamps — needed for Grafana time-series panels and Evidently reference windows. Redis would require a separate time-series store for historical queries.
+
+**Training: scikit-learn + XGBoost (not Spark)**
+The training dataset is windowed features from a single dark-store cluster — comfortably under 1M rows. Spark adds overhead (JVM, cluster startup) for no benefit at this scale. scikit-learn and XGBoost load Parquet directly via pandas/pyarrow and are easier to register with MLflow's sklearn/xgboost flavors.
+
+**Online scoring: Flink hot-swap (not a separate serving endpoint)**
+The Flink taskmanager holds the model in memory and polls MLflow for promotions every 5 minutes. This means the same process that computes features also scores them — no network hop, sub-millisecond latency per window. The tradeoff is that the model lives in the taskmanager JVM heap, limiting model size.
+
+**Drift detection: all three metrics**
+PSI is the industry default (interpretable thresholds). KS is a formal statistical test for continuous features. JS is symmetric and bounded. Using all three in `drift_job.py` gives a complete picture and demonstrates understanding of each metric's limitations.
+
+**Orchestration: Dagster (not Airflow)**
+Dagster's asset-oriented model maps directly to the ML pipeline DAG (features → model → eval as typed assets). The conditional retrain becomes a real dependency graph rather than a manual `if` check in a task. Also avoids duplication with UrbanPulse (which already shows Airflow).
+
+**OIDC (not stored AWS keys)**
+GitHub Actions assumes an IAM role via short-lived STS tokens. No credentials to rotate, no risk from secret leaks. The trust policy scopes it to `repo:Anand09-in/veloshelf:*`.
+
+---
+
+## Cost (AWS ap-south-1)
+
+| Resource | Running | Stopped |
+|---|---|---|
+| EC2 m7i-flex.large | ~$73/mo | $0 |
+| RDS db.t3.micro | ~$12/mo | ~$12/mo (storage billed) |
+| S3 (< 1GB) | < $0.03/mo | — |
+| **Total idle** | — | **~$12/mo** |
+
+Stop the EC2 when not demoing: `make ec2-stop`. Destroy everything when done: `make infra-down`.
+
+---
+
+## Interview Q&A
+
+**"Why synthetic data?"**
+Full control of distributions lets you demo anomalies on demand. More importantly, injected anomalies are logged as ground-truth labels in `data/seeds/anomaly_labels.jsonl` — so you get real precision/recall/F1 against known positives. Real event streams can't give you that without expensive human labelling.
+
+**"Why PyFlink over Spark Structured Streaming?"**
+Event-time watermarks and tumbling/sliding window semantics are first-class in Flink. The Table API gives clean SQL-style window aggregation. Spark Structured Streaming handles late data less elegantly and the PyFlink keyword is differentiated.
+
+**"How does drift detection feed retraining?"**
+`drift_job.py` runs every 2h (Dagster schedule), computes PSI/KS/JS per feature using Evidently, and writes a summary as asset metadata. `drift_retrain_sensor` reads that metadata on each tick; if `any_drift=True` (PSI > 0.25), it requests runs of `detector_retrain_job` and `forecaster_retrain_job`. Cooldown sentinel files in `.retrain_cooldowns/` prevent re-triggering within the cooldown window.
+
+**"What's the validation gate?"**
+`ml/promote.py` only promotes a new model to the MLflow `Production` alias if its holdout metrics beat the current Production incumbent. Drift does not equal better model — retraining on a drifted distribution can make performance worse.
+
+**"Why not EKS?"**
+$72/month for a portfolio piece. The architecture is designed for EKS — Terraform module for EKS committed, k8s manifests written — but runs single-node for cost. "Designed for Kubernetes, ran single-node to stay in free tier" is a stronger answer than silently skipping it.

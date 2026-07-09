@@ -90,18 +90,6 @@ flowchart LR
 
 ---
 
-## Build phases
-
-| # | Phase | What was built |
-|---|---|---|
-| 1 | **Ingestion** | Synthetic event generator — Poisson/Zipf arrivals, anomaly injector, Kafka producer |
-| 2 | **Stream processing** | PyFlink job — tumbling windows, event-time watermarks, Postgres + dead-letter sinks |
-| 3 | **ML layer** | IsolationForest detector + XGBoost forecaster, MLflow registry, Dagster asset graph, online scorer |
-| 4 | **Observability** | Prometheus metrics exporter, Grafana dashboards, Evidently drift reports, Streamlit |
-| 5 | **Closed-loop retraining** | Drift sensor with PSI threshold, cooldown sentinel files, automatic retrain jobs |
-| 6 | **IaC + CI/CD** | Terraform modules (EC2 / RDS / S3 / networking), GitHub Actions CI + SSH deploy |
-
----
 
 ## Local development
 
@@ -157,34 +145,6 @@ make infra-up
 # SSH in and start the stack
 make ec2-ssh
 ```
-
-**Cost controls:**
-
-```bash
-make ec2-stop    # pause EC2 when not demoing  (~$0.10/hr saved)
-make ec2-start   # resume before a demo
-make infra-down  # destroy everything when done
-```
-
-> Running cost: EC2 m7i-flex.large ~$73/mo + RDS db.t3.micro ~$12/mo.  
-> Stop EC2 between demos → pay only ~$12/mo idle.
-
----
-
-## GitHub Actions secrets
-
-To enable the CD pipeline (auto-deploy on push to `main`), add these in **Settings → Secrets → Actions**:
-
-| Secret | Value |
-|---|---|
-| `AWS_DEPLOY_ROLE_ARN` | ARN of the GitHub Actions IAM role (OIDC) |
-| `TF_STATE_BUCKET` | `veloshelf-tfstate-<account-id>` |
-| `TF_LOCK_TABLE` | `veloshelf-tfstate-lock` |
-| `S3_SUFFIX` | your AWS account ID |
-| `EC2_KEY_NAME` | `veloshelf-key` |
-| `EC2_SSH_PRIVATE_KEY` | contents of `veloshelf-key.pem` |
-| `DB_PASSWORD` | Postgres master password |
-
 ---
 
 ## Repository layout

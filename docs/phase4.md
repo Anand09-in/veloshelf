@@ -1,160 +1,135 @@
-# Phase 4 — Observability (Prometheus + Grafana + Evidently + Streamlit)
+# Phase 4 — Observability
 
-> Goal: a complete observability + serving layer.
-> Grafana shows live pipeline health; Evidently detects rolling data drift;
-> Streamlit gives business-facing inventory intelligence.
-
-**Definition of done:**
-- `make test` passes all Phase 4 tests.
-- `make up` starts Prometheus (9090), Grafana (3001), metrics-exporter (8000), Streamlit (8501).
-- Grafana UI shows live metrics from the pipeline.
-- `python -m observability.drift_job` generates an HTML report in `data/reports/`.
-- Streamlit dashboard shows stockout-risk SKUs and active alerts from Postgres.
-- Dagster UI shows 6 assets + 3 schedules.
+Three complementary observability surfaces: Prometheus + Grafana for live pipeline health (ops view), Evidently for deep drift analysis (data science view), and Streamlit for actionable inventory intelligence (business view).
 
 ---
 
-## Task list
+## Files
 
-### New files
-- [x] `observability/__init__.py`
-- [x] `observability/drift_job.py`       — rolling drift (PSI+KS+JS), Evidently HTML report
-- [x] `observability/metrics_exporter.py` — Prometheus gauges, background pollers
-- [x] `observability/prometheus/prometheus.yml` — scrape config
-- [x] `observability/prometheus/alerts.yml`     — alerting rules
-- [x] `serving/grafana/datasource.yml`   — Grafana Prometheus datasource provisioning
-- [x] `serving/streamlit_app.py`         — business dashboard (stockout, surge, velocity, drift)
-- [x] `tests/test_observability.py`      — unit tests (PSI, KS, JS, window split, push helpers)
-
-### Updated files
-- [x] `orchestration/assets.py`    — added drift_report asset
-- [x] `orchestration/schedules.py` — added drift_schedule (every 2h)
-- [x] `orchestration/definitions.py` — wires drift_report + drift_schedule
-- [x] `docker-compose.yml`         — added prometheus, grafana, metrics-exporter, streamlit
-- [x] `pyproject.toml`             — added evidently, scipy, prometheus-client, streamlit
-- [x] `requirements.txt`           — same
-
-### Verification steps
-- [ ] `make test`  — all tests pass
-- [ ] `make lint`  — ruff clean
-- [ ] `make setup` — new deps installed
-- [ ] `make up`    — all services healthy
-- [ ] Prometheus UI reachable: http://localhost:9090
-- [ ] Grafana UI reachable: http://localhost:3001 (user: admin / pass: veloshelf)
-- [ ] metrics-exporter: http://localhost:8000/metrics shows gauge names
-- [ ] Streamlit: http://localhost:8501 loads dashboard
-- [ ] `python -m observability.drift_job` generates report in data/reports/
-- [ ] Dagster: http://localhost:3000 shows 6 assets + 3 schedules
+| File | Role |
+|---|---|
+| `observability/drift_job.py` | Evidently: PSI + KS + JS per feature, HTML report → `data/reports/` |
+| `observability/metrics_exporter.py` | Prometheus gauges: freshness lag, drift PSI, MAE/F1, alert counts |
+| `observability/retrain_trigger.py` | Threshold check + cooldown sentinel logic (used by Phase 5 sensor) |
+| `observability/prometheus/prometheus.yml` | Scrape config: targets metrics-exporter at `metrics-exporter:8000` |
+| `observability/prometheus/alerts.yml` | Alerting rules: high freshness lag, persistent drift, no alerts in 1h |
+| `serving/grafana/datasource.yml` | Prometheus datasource provisioning (auto-loaded at Grafana startup) |
+| `serving/grafana/dashboard.yml` | Dashboard provider config (watches provisioning directory for JSON files) |
+| `serving/grafana/veloshelf_dashboard.json` | 4-section dashboard with stat panels, time-series, and model performance |
+| `serving/streamlit_app.py` | Business dashboard: stockout risk, surge alerts, velocity, drift status |
 
 ---
 
-## Step-by-step verification
+## Prometheus metrics — `observability/metrics_exporter.py`
 
-### 1 — Tests and lint
-```bash
-make setup     # installs evidently, scipy, prometheus-client, streamlit
-make test      # all phases
-make lint
-```
+A long-running Python process exposing metrics at `:8000/metrics` via `prometheus_client`. Background threads poll Postgres and MLflow on configurable intervals.
 
-### 2 — Start the full stack
-```bash
-make up
-docker-compose ps   # all services healthy
-```
+**Pipeline health gauges:**
 
-### 3 — Verify Prometheus scraping metrics
-```bash
-# Check /metrics endpoint
-curl http://localhost:8000/metrics | grep veloshelf
+| Metric | Description |
+|---|---|
+| `veloshelf_feature_freshness_lag_seconds` | Seconds since the most recent `window_end` in `windowed_features` |
+| `veloshelf_active_alerts_total` | Count of alerts in the last 5 minutes, labelled by `alert_type` |
+| `veloshelf_windowed_feature_rows_total` | Total row count in `windowed_features` |
 
-# Open Prometheus UI → Status → Targets
-# http://localhost:9090/targets
-# veloshelf-pipeline should show UP
-```
+**Drift gauges** (written by `drift_job.py` via `push_to_gateway` or direct gauge set):
 
-### 4 — Verify Grafana
-Open http://localhost:3001
-- Login: admin / veloshelf
-- Connections → Data sources → Prometheus should be auto-provisioned
-- Explore → query `veloshelf_feature_freshness_lag_seconds`
+| Metric | Description |
+|---|---|
+| `veloshelf_drift_psi{feature}` | Population Stability Index per feature |
+| `veloshelf_drift_ks{feature}` | Kolmogorov-Smirnov statistic per feature |
+| `veloshelf_drift_js{feature}` | Jensen-Shannon divergence per feature |
+| `veloshelf_drift_detected` | 1 if any feature has PSI > 0.25, else 0 |
 
-Import a dashboard:
-- Dashboards → Import → Upload the dashboard.json from serving/grafana/
-  (if present; can also be built manually in the UI)
+**Model performance gauges** (polled from MLflow Production run metrics):
 
-### 5 — Run drift job
+| Metric | Description |
+|---|---|
+| `veloshelf_forecaster_mae` | MAE of the current Production forecaster |
+| `veloshelf_detector_f1` | F1 of the current Production detector |
+
+---
+
+## Grafana dashboard — auto-provisioned
+
+Grafana loads provisioning config at startup from `/etc/grafana/provisioning/`. Two files are mounted read-only from the repo:
+
+- `serving/grafana/datasource.yml` → `/etc/grafana/provisioning/datasources/datasource.yml` — registers the Prometheus datasource pointing at `http://prometheus:9090`
+- `serving/grafana/dashboard.yml` → `/etc/grafana/provisioning/dashboards/dashboard.yml` — tells Grafana to watch `/etc/grafana/provisioning/dashboards/` for JSON files, with `updateIntervalSeconds: 30`
+- `serving/grafana/veloshelf_dashboard.json` → `/etc/grafana/provisioning/dashboards/veloshelf_dashboard.json` — the dashboard definition
+
+On container start, the dashboard is immediately available. No manual import needed. Changes to the JSON file are picked up within 30 seconds without a restart (`allowUiUpdates: true` lets you also edit in the UI and export back).
+
+### Dashboard sections
+
+**Pipeline Health** (stat panels, top row)
+- Feature freshness lag (seconds since last window close)
+- Drift detected (yes/no)
+- Active alerts (count)
+- Max PSI (worst feature drift score)
+
+**Drift Metrics** (time-series)
+- PSI, KS, JS per feature over the last 24h
+
+**Pipeline Activity** (time-series)
+- Freshness lag over time (SLA line at 120s)
+- Alert count over time (stockout vs. surge)
+
+**Model Performance** (time-series)
+- Forecaster MAE over model versions
+- Detector F1 over model versions
+
+---
+
+## Evidently drift job — `observability/drift_job.py`
+
+Runs as a Dagster asset (`drift_report`) on the 2h schedule and can also be invoked directly:
 ```bash
 python -m observability.drift_job
 ```
-Expected:
-```
-INFO  Drift | order_rate       psi=0.0xxx ks=0.0xxx js=0.0xxx drifted=False
-INFO  Drift job complete | any_drift=False report=data/reports/drift_*.html
-```
-Open the HTML report in browser.
 
-### 6 — View Streamlit dashboard
-```bash
-# If running locally (not in Docker):
-streamlit run serving/streamlit_app.py
-```
-Open http://localhost:8501
+**Reference vs. current window split:**
+- Reference: feature rows from the 24h window ending 1h ago
+- Current: feature rows from the last 1h
 
-The dashboard auto-refreshes every 30s and shows:
-- Pipeline status badge + freshness lag
-- Stockout-risk SKUs sorted by depletion velocity
-- Active surge alerts
-- Per-store order velocity heatmap
-- Store health summary
-- Latest drift report link
+Rolling reference is more appropriate for quick-commerce than a fixed baseline — demand is intrinsically time-varying (lunch peaks, weekends). A fixed baseline would permanently "drift" as the business grows.
 
-### 7 — Verify Dagster has 6 assets + 3 schedules
-Open http://localhost:3000 → Assets
-Expected asset graph:
-```
-windowed_features_parquet
-  ├── detector_training_run  → detector_promotion
-  ├── forecaster_training_run → forecaster_promotion
-  └── drift_report
-```
-Schedules: detector_retrain (6h), forecaster_retrain (6h+30m), drift_check (2h)
+**Drift metrics computed per feature** (order_rate, depletion_velocity, demand_momentum, on_hand_est):
+
+| Metric | What it tests | Limitation |
+|---|---|---|
+| PSI | Overall shape shift; industry standard | Not a statistical test; sensitive to binning |
+| KS statistic | Formal test on CDF; gives p-value | Only tests CDF; misses variance changes |
+| JS divergence | Symmetric, bounded [0,1]; works for discrete | Less interpretable threshold than PSI |
+
+PSI thresholds: < 0.1 stable · 0.1–0.25 moderate shift · > 0.25 significant shift (triggers retrain sensor).
+
+Output:
+- Summary dict `{feature: {psi, ks, js, drifted}, any_drift: bool}` — stored as Dagster asset metadata
+- Evidently HTML report → `data/reports/drift_YYYYMMDD_HHMMSS.html`
 
 ---
 
-## Design notes (for interviews)
+## Streamlit dashboard — `serving/streamlit_app.py`
 
-**Why three separate surfaces?**
-Grafana / Prometheus: ops + engineering — time-series, pipeline health,
-infra metrics. Evidently reports: data-science — deep drift analysis,
-feature distributions. Streamlit: business — actionable inventory
-intelligence, no raw metrics.
+Business-facing view that reads directly from Postgres. Auto-refreshes every 30 seconds.
 
-**Rolling vs fixed reference for drift:**
-Rolling (last 1h vs prior 24h) is more appropriate for quick-commerce
-because demand is intrinsically time-varying (lunch peaks, weekends).
-A fixed baseline would permanently "drift" as the business grows.
-The tradeoff: rolling reference can miss slow, gradual drift that a
-fixed baseline would catch.
+**Panels:**
+- **Pipeline status** — freshness lag badge (green < 60s, yellow < 120s, red ≥ 120s)
+- **Stockout-risk SKUs** — sorted by `depletion_velocity DESC`, showing estimated time to empty
+- **Active surge alerts** — alert log from the last 15 minutes, labelled by severity
+- **Per-store velocity heatmap** — order_rate per store_id × category, current window
+- **Store health summary** — aggregated freshness and alert count per store
+- **Latest drift report link** — links to the most recent HTML report in `data/reports/`
 
-**PSI vs KS vs JS — what each catches:**
-PSI:  overall shape shift, most common in industry, interpretable thresholds.
-      Limitation: not a true statistical test, sensitive to binning.
-KS:   formal statistical test for continuous features, p-value tells you
-      significance. Limitation: only tests CDF, misses variance changes.
-JS:   symmetric, bounded [0,1], works for both continuous and discrete.
-      Limitation: less interpretable than PSI for practitioners.
-Using all three gives the most complete picture and shows you understand
-the tradeoffs, not just cargo-culted one metric.
-
-**Evidently fallback:**
-drift_job.py uses Evidently if installed, falls back to a plain HTML
-summary otherwise. This means the drift job runs even in minimal
-environments. Install evidently properly for rich interactive reports.
+Credentials: none. The app reads `POSTGRES_DSN` from environment. On AWS, that DSN points at the RDS endpoint.
 
 ---
 
-## Deferred to Phase 5
-- Drift sensor in Dagster (auto-trigger retrain when drift_report detects PSI > threshold)
-- Retrain cooldown enforcement in the sensor
-- Great Expectations quality suite
+## Design — why three surfaces
+
+**Grafana (ops / engineering):** time-series, pipeline health, SLAs, model metrics. Prometheus pull model means adding a new metric is a one-line gauge registration — no pipeline changes. Designed for on-call engineers who need to see what's happening right now.
+
+**Evidently (data science):** deep distributional analysis per feature. HTML reports are shareable artefacts, not just dashboards. The interactive distribution comparisons reveal *why* PSI is elevated, not just *that* it is.
+
+**Streamlit (business):** no Prometheus knowledge required. Inventory managers read "SKU_042 — 4 min to empty at current depletion rate" directly. The gap between ops tooling and business intelligence is real; bridging it with Streamlit is a portfolio differentiator.

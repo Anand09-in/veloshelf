@@ -1,149 +1,147 @@
-# Phase 5 — Closed-Loop Retraining (Drift-Triggered)
+# Phase 5 — Closed-Loop Retraining
 
-> Goal: a Dagster sensor that watches drift_report materializations and
-> automatically triggers retraining when PSI exceeds threshold,
-> with a cooldown guard to prevent retrain storms.
-
-**Definition of done:**
-- `make test` passes all Phase 5 tests.
-- Dagster UI shows `drift_retrain_sensor` under Automation → Sensors.
-- Sensor can be turned on and evaluated manually in the UI.
-- When drift is detected, the sensor queues `detector_retrain_job`
-  and/or `forecaster_retrain_job` runs visible in Dagster Run History.
-- Cooldown prevents re-triggering within the configured window.
+A Dagster sensor that watches `drift_report` materializations and automatically queues retraining jobs when PSI exceeds threshold. Cooldown sentinel files prevent retrain storms. The Phase 3 validation gate ensures only better models get promoted.
 
 ---
 
-## Task list
+## Files
 
-### New files
-- [x] `observability/retrain_trigger.py` — pure Python trigger decision + cooldown logic
-- [x] `orchestration/sensors.py`         — Dagster sensor watching drift_report
-- [x] `tests/test_phase5.py`             — unit tests for trigger logic + cooldowns
-
-### Updated files
-- [x] `orchestration/definitions.py`     — registers drift_retrain_sensor
-
-### Verification steps
-- [ ] `make test`  — all tests pass (88 + new phase5 tests)
-- [ ] `make lint`  — ruff clean
-- [ ] Dagster UI → Automation → Sensors shows `drift_retrain_sensor`
-- [ ] Turn sensor ON in Dagster UI
-- [ ] Manually trigger drift_check_job to produce a fresh drift_report
-- [ ] If drift detected → sensor fires → retrain runs appear in Run History
-- [ ] Verify cooldown: sensor does not fire again immediately after triggering
-- [ ] Check `.retrain_cooldowns/` directory for sentinel files
+| File | Role |
+|---|---|
+| `observability/retrain_trigger.py` | Pure-Python trigger decision + cooldown read/write |
+| `orchestration/sensors.py` | Dagster `drift_retrain_sensor` — watches drift_report, requests retrain jobs |
+| `orchestration/definitions.py` | Registers the sensor alongside assets and schedules |
 
 ---
 
-## Step-by-step verification
+## How the loop runs
 
-### 1 — Tests and lint
-```bash
-make test
-make lint
+```
+drift_check_schedule (every 2h)
+    └── drift_report asset materialises
+            └── stores {psi, ks, js, any_drift} as Dagster asset metadata
+
+drift_retrain_sensor (evaluates every 5 min)
+    └── reads latest drift_report metadata
+            ├── any_drift=False → SkipReason("no drift")
+            ├── cooldown active  → SkipReason("cooldown until <timestamp>")
+            └── any_drift=True + no cooldown
+                    ├── RunRequest(job=detector_retrain_job)
+                    ├── RunRequest(job=forecaster_retrain_job)
+                    └── writes cooldown sentinel files
+
+detector_retrain_job / forecaster_retrain_job
+    └── export_features → train → validate → promote (if better)
+
+HotSwapModelLoader in Flink (polls every 5 min)
+    └── detects new Production version → swaps in-memory model
 ```
 
-### 2 — Restart Dagster to pick up sensor
-```bash
-docker-compose restart dagster
-# or if running locally:
-# restart: dagster dev -f orchestration/definitions.py
+Total lag from drift detection to new model live: **10–20 minutes** (drift job ~30s, sensor tick up to 5 min, training ~2–5 min, Flink hot-swap up to 5 min).
+
+---
+
+## Trigger logic — `observability/retrain_trigger.py`
+
+`should_retrain(model_name, drift_summary, cooldown_hours=4)`:
+
+1. Read `drift_summary["any_drift"]` — if False, return `(False, "no drift")`
+2. Check `.retrain_cooldowns/{model_name}.last_triggered` — if the file exists and was written within `cooldown_hours`, return `(False, "cooldown active until {timestamp}")`
+3. Otherwise return `(True, "drift detected, PSI={max_psi}")`
+
+`record_trigger(model_name)`:
+- Writes the current UTC timestamp to `.retrain_cooldowns/{model_name}.last_triggered`
+- Creates the `.retrain_cooldowns/` directory if it doesn't exist
+
+The sentinel files are plain text (ISO-8601 timestamp). They survive Dagster restarts and container restarts because `.retrain_cooldowns/` is on the mounted volume (`.:/app` in docker-compose).
+
+---
+
+## Dagster sensor — `orchestration/sensors.py`
+
+```python
+@sensor(job=[detector_retrain_job, forecaster_retrain_job], minimum_interval_seconds=300)
+def drift_retrain_sensor(context):
+    ...
 ```
 
-### 3 — Enable the sensor in Dagster UI
-Open http://localhost:3000 → Automation → Sensors
+On each evaluation (every 5 min):
 
-You should see `drift_retrain_sensor`. Click it → **Start sensor**.
+1. Load the most recent `drift_report` asset materialisation record from Dagster's event log
+2. Extract the drift summary from the materialisation metadata
+3. If no recent materialisation (older than 3h), yield `SkipReason`
+4. For each model (`detector`, `forecaster`):
+   - Call `should_retrain(model_name, drift_summary)`
+   - If True: `record_trigger(model_name)` + `yield RunRequest(run_key=..., job_name=...)`
+5. If neither retrained: yield `SkipReason` with reason
 
-### 4 — Manually trigger a drift run to test the loop
+`run_key` is set to `f"{model_name}_{drift_report_run_id}"` so the same drift report never triggers duplicate retrain runs even if the sensor evaluates multiple times before training completes.
 
-Option A — via Dagster UI:
-- Jobs → `drift_check_job` → Launch Run
+**Fallback**: if `drift_report` metadata is absent (e.g., the drift job ran outside Dagster via `python -m observability.drift_job`), the sensor calls `drift_job.run()` inline to get fresh data. This makes the sensor robust to out-of-band runs.
 
-Option B — via CLI:
+---
+
+## Cooldown design
+
+Two guardrails operate independently:
+
+**Cooldown (Phase 5)** — prevents retrain storms. A noisy or persistent drift signal could trigger retraining on every sensor tick. 4-hour cooldown means at most 6 retrains per day per model, regardless of how frequently drift is detected.
+
+**Validation gate (Phase 3)** — prevents silent degradation. Even if retraining fires, `ml/promote.py` will not promote the new model unless it beats the current Production incumbent. Drift can cause retraining to produce a *worse* model on the new distribution; the gate catches this.
+
+The two guardrails cover different failure modes and are not redundant.
+
+---
+
+## Sentinel files
+
+```
+.retrain_cooldowns/
+├── detector_retrain.last_triggered     # "2024-01-15T14:32:11Z"
+└── forecaster_retrain.last_triggered   # "2024-01-15T14:35:04Z"
+```
+
+To force a retrain immediately (bypass cooldown for testing):
 ```bash
+rm .retrain_cooldowns/*.last_triggered
+```
+
+Then manually evaluate the sensor in Dagster UI → Automation → Sensors → `drift_retrain_sensor` → Evaluate.
+
+---
+
+## End-to-end verification
+
+```bash
+# 1. Start generator to produce features
+python -m generator.producer --mode fast   # run ~3 min
+
+# 2. Run drift job directly (or wait for Dagster schedule)
 python -m observability.drift_job
-```
 
-### 5 — Watch the sensor fire (if drift detected)
-In Dagster UI → Automation → Sensors → `drift_retrain_sensor`:
-- Click **Evaluate** to manually tick the sensor
-- If drift_summary shows `any_drift=True` → you'll see run requests created
-- Dagster UI → Runs → should show new `detector_retrain_job` and/or
-  `forecaster_retrain_job` runs queued
+# 3. Check Dagster sensor in UI
+# http://localhost:3000 → Automation → Sensors → drift_retrain_sensor
+# Click "Evaluate" if any_drift=True and no cooldown active
 
-### 6 — Verify cooldown is respected
-After a successful trigger, the sensor should skip on the next tick:
-```bash
-ls .retrain_cooldowns/
-# Should show: detector_retrain.last_triggered
-#              forecaster_retrain.last_triggered
-```
+# 4. Watch retrain jobs in Run History
+# http://localhost:3000 → Runs
 
-Manually evaluate the sensor again in the UI — it should return a
-SkipReason mentioning "cooldown".
+# 5. Check MLflow for new model version
+# http://localhost:5000 → Models → veloshelf-anomaly-detector
 
-### 7 — Test the full closed loop end-to-end
-```bash
-# 1. Run generator in fast mode for 2+ minutes
-python -m generator.producer --mode fast
-
-# 2. Run drift job
-python -m observability.drift_job
-
-# 3. If drift detected, check Dagster runs
-# 4. After retrain completes, check MLflow for new model version
-#    http://localhost:5000 → Models → veloshelf-anomaly-detector
-# 5. Within 5 min, Flink job hot-swaps to new model
-#    docker-compose logs flink-taskmanager | grep "Hot-swapped"
+# 6. Confirm Flink hot-swap (within 5 min of promotion)
+docker compose logs flink-taskmanager | grep "Hot-swapped"
 ```
 
 ---
 
-## Design notes (for interviews)
+## Interview talking points
 
-**Why a Dagster sensor rather than a cron that always retrains?**
-Retrain only when the data distribution has actually shifted — not on
-a fixed schedule. This is more cost-efficient and avoids unnecessary
-model churn. The drift signal is the trigger, not the clock.
+**"Why sensor-triggered (not always-on retrain)?"**
+Retrain only when data distribution has actually shifted — not on a fixed clock. This is more cost-efficient (training jobs are the most expensive step), avoids unnecessary model churn, and makes the retrain signal meaningful. The drift measurement is the justification for the retrain, not just a coincidence.
 
-**Why separate cooldown from the MLflow promotion gate?**
-Two independent guardrails serve different failure modes:
-- Promotion gate (Phase 3): "is the new model actually better?"
-  Guards against promoting a worse model.
-- Cooldown (Phase 5):       "are we retraining too frequently?"
-  Guards against retrain storms from a noisy or persistent drift signal.
-Both are needed. A model could be better than the incumbent but still
-trigger too frequently if drift is persistent.
+**"How do you prevent a cascade of retrains?"**
+Two mechanisms: the 4-hour cooldown prevents the same drift signal from triggering back-to-back runs; and the `run_key` on each `RunRequest` prevents Dagster from launching duplicate runs for the same drift event if the sensor evaluates multiple times before the first training completes.
 
-**Why does the sensor fall back to running drift_job inline?**
-If the Dagster materialization metadata doesn't carry the drift summary
-(e.g. the drift job ran outside Dagster), the sensor runs the drift job
-directly to get fresh data. This makes the sensor more robust to
-out-of-band drift runs.
-
-**What happens during the hot-swap?**
-After the new model is promoted in the MLflow registry, the Flink
-`FeatureSinkFn`'s `HotSwapModelLoader` picks it up within
-MODEL_POLL_INTERVAL_S (default 300s / 5 min) without a job restart.
-The old model continues scoring during the gap — there is no downtime.
-
-**Full loop timing (approximate):**
-- drift_check_schedule fires (every 2h)
-- drift_job runs: ~10–30s
-- sensor evaluates (every 5min): picks up new drift_report
-- if drift: retrain jobs queue immediately
-- detector training: ~1–3 min (depends on data size)
-- promotion gate: ~10s
-- Flink hot-swap: within 5 min of promotion
-- Total lag: drift detection → new model live ≈ 10–15 min
-
----
-
-## Deferred to Phase 6
-- Terraform IaC for AWS deployment
-- GitHub Actions CI/CD (OIDC)
-- Switch FEATURES_PATH to S3
-- EKS manifests (design intent, not run)
-- README polish with architecture diagram + screenshots
+**"What if training makes the model worse?"**
+The validation gate in `ml/promote.py` handles this — the new model must beat the incumbent on holdout metrics before the `Production` alias is updated. The Flink scorer keeps using the old model until a better one is promoted. A retrain that doesn't improve quality is logged in MLflow as a rejected run.
