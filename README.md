@@ -1,143 +1,214 @@
 # VeloShelf
 
-**Real-time quick-commerce intelligence pipeline** — a production-grade streaming data + ML platform modelled after Blinkit/Zepto dark-store operations.
-
-Ingests live order and inventory events, computes windowed features in real time, detects **stockouts** and **demand surges**, forecasts short-horizon demand, and runs with full data observability, drift detection, and closed-loop automated retraining — deployed on AWS.
+Real-time inventory intelligence for quick-commerce dark stores — a production-grade streaming ML platform that covers the full lifecycle from raw events to closed-loop model retraining.
 
 ---
 
 ## Architecture
 
-```
-Synthetic Generator (Poisson arrivals + Zipf SKU popularity + anomaly injection)
-        │
-        ▼ order & inventory events
-   Kafka (KRaft, single broker)
-        │
-        ▼
-   PyFlink (event-time tumbling + sliding windows)
-   ├── Validation → dead-letter quarantine
-   ├── Windowed features (order_rate, depletion_vel, demand_momentum, on_hand_est)
-   └── Online scoring (Isolation Forest hot-swap, rule-based fallback)
-        │
-        ├──► Postgres RDS     (serving store — live dashboard)
-        ├──► S3 Parquet       (training corpus — batch ML layer)
-        └──► Kafka alerts     (stockout-alerts, surge-alerts)
-                │
-                ▼
-   Dagster (asset-oriented orchestration)
-   ├── drift_check (every 2h) → Evidently PSI + KS + JS → HTML report
-   ├── detector_retrain (every 6h + drift-triggered) → Isolation Forest → MLflow
-   ├── forecaster_retrain (every 6h + drift-triggered) → XGBoost → MLflow
-   └── drift_retrain_sensor → triggers retrain when PSI > 0.25
-                │
-                ▼
-   MLflow Registry (validation gate + cooldown → promote to Production)
-                │
-                ▼ hot-swap within 5 min (no Flink restart)
-   Flink online scorer ← always running
+```mermaid
+flowchart LR
+    subgraph Ingestion
+        G["Generator\nPoisson arrivals · Zipf SKU dist\nAnomaly injection"]
+        G -->|raw-orders\nraw-inventory| K["Kafka 3.8\nKRaft · 3 partitions"]
+    end
 
-   Observability:
-   ├── Prometheus + Grafana  (pipeline health, freshness lag, alert counts, PSI gauges)
-   └── Streamlit             (business dashboard — stockout risk, surge alerts, velocity)
+    subgraph Streaming["Stream Processing · PyFlink 1.18"]
+        K --> FJ["Flink Job\nTumbling windows · event-time\nwatermarks · dead-letter sink"]
+        FJ -->|upsert| PG[("Postgres 16\nwindowed_features\nalerts")]
+    end
+
+    subgraph ML["ML Platform · MLflow 3.1"]
+        PG --> EX["export_features\nParquet"]
+        EX --> DET["Isolation Forest\nAnomaly Detector"]
+        EX --> FORE["XGBoost\nDemand Forecaster"]
+        DET & FORE --> MLF[("MLflow\nModel Registry")]
+        MLF -->|Production alias| SC["Online Scorer\nper-event inference"]
+        SC --> PG
+    end
+
+    subgraph Orch["Orchestration · Dagster 1.9"]
+        DAG["Asset Graph"]
+        DAG -->|every 6h| DET & FORE
+        DAG -->|every 2h| DR["Evidently Drift\nPSI · KS · JS"]
+        DR -->|PSI > 0.25| DAG
+    end
+
+    subgraph Obs["Observability"]
+        PG & MLF --> ME["Metrics Exporter\nPrometheus gauges"]
+        ME --> PROM["Prometheus"] --> GR["Grafana\nDashboards"]
+        PG --> ST["Streamlit\nBusiness View"]
+    end
+
+    subgraph Infra["AWS · Terraform"]
+        direction TB
+        EC2["EC2 m7i-flex.large\nDocker Compose"]
+        RDS[("RDS Postgres\ndb.t3.micro")]
+        S3[("S3\nParquet + Artifacts")]
+    end
 ```
 
 ---
 
-## Stack
+## Grafana Dashboard
 
-| Layer | Tools |
+![VeloShelf Pipeline Health Dashboard](docs/grafana_dashboard.png)
+
+*Four sections: Pipeline Health (freshness lag, drift status, active alerts, max PSI) · Drift Metrics (PSI / KS / JS per feature over time) · Pipeline Activity (freshness lag + alert counts) · Model Performance (Forecaster MAE, Detector F1)*
+
+---
+
+## What it does
+
+| Capability | Detail |
 |---|---|
-| Ingestion | Python, Kafka (KRaft) |
-| Stream processing | PyFlink (event-time windows) |
-| Batch ML | Apache Spark, XGBoost, Isolation Forest |
-| ML tracking | MLflow (registry + hot-swap) |
-| Drift detection | Evidently (PSI + KS + JS divergence) |
-| Orchestration | Dagster (assets + schedules + sensor) |
-| Serving store | AWS RDS Postgres |
-| Object storage | AWS S3 |
-| Observability | Prometheus, Grafana, Streamlit |
-| IaC | Terraform (S3 backend + DynamoDB lock) |
-| CI/CD | GitHub Actions + OIDC (zero stored credentials) |
-| Containers | Docker, docker-compose |
+| **Synthetic load** | Poisson order arrivals, Zipf SKU distribution, configurable anomaly injection |
+| **Streaming features** | 1-min tumbling windows → `order_rate`, `depletion_vel`, `demand_momentum`, `on_hand_est` |
+| **Anomaly detection** | Isolation Forest trained on windowed features, served online per event |
+| **Demand forecasting** | XGBoost forecaster, MAE-optimised, promoted to MLflow Production |
+| **Drift monitoring** | Evidently computes PSI / KS / JS every 2 h; sensor auto-retriggers training when PSI > 0.25 |
+| **Closed-loop retraining** | Cooldown-gated retrain jobs fire automatically — no human intervention |
+| **Observability** | Prometheus scrapes feature freshness, alert counts, model MAE / F1, drift metrics |
 
 ---
 
-## Quickstart (local)
+## Tech stack
+
+| Layer | Technology |
+|---|---|
+| Event streaming | Apache Kafka 3.8 (KRaft mode, dual listeners) |
+| Stream processing | PyFlink 1.18 — event-time tumbling windows, watermarks, dead-letter |
+| Serving store | Postgres 16 |
+| ML training | Scikit-learn (IsolationForest), XGBoost |
+| Experiment tracking | MLflow 3.1 — model registry, artifact store |
+| Orchestration | Dagster 1.9 — asset graph, schedules, drift sensor |
+| Drift detection | Evidently — PSI, KS statistic, Jensen-Shannon divergence |
+| Metrics | Prometheus + Grafana 10 |
+| Business dashboard | Streamlit |
+| IaC | Terraform 1.7 (VPC, EC2, RDS, S3, IAM) |
+| CI / CD | GitHub Actions — lint + test on PR, SSH deploy on merge to main |
+
+---
+
+## Build phases
+
+| # | Phase | What was built |
+|---|---|---|
+| 1 | **Ingestion** | Synthetic event generator — Poisson/Zipf arrivals, anomaly injector, Kafka producer |
+| 2 | **Stream processing** | PyFlink job — tumbling windows, event-time watermarks, Postgres + dead-letter sinks |
+| 3 | **ML layer** | IsolationForest detector + XGBoost forecaster, MLflow registry, Dagster asset graph, online scorer |
+| 4 | **Observability** | Prometheus metrics exporter, Grafana dashboards, Evidently drift reports, Streamlit |
+| 5 | **Closed-loop retraining** | Drift sensor with PSI threshold, cooldown sentinel files, automatic retrain jobs |
+| 6 | **IaC + CI/CD** | Terraform modules (EC2 / RDS / S3 / networking), GitHub Actions CI + SSH deploy |
+
+---
+
+## Local development
+
+**Prerequisites:** Docker, conda
 
 ```bash
-git clone https://github.com/Anand09-in/veloshelf
-cd veloshelf
-
-# Python env
+# 1. Create environment
 conda create -n veloshelf python=3.11 -y
 conda activate veloshelf
-make setup
+pip install -e ".[dev]"
 
-# Start local stack
-make up           # Kafka + Flink + Postgres + MLflow + Dagster
+# 2. Start all services
+make up
+make initdb
+make topics
 
-# One-time setup
-make jar          # downloads Flink Kafka connector JAR
-make initdb       # creates Postgres tables
-make topics       # creates all 5 Kafka topics
+# 3. Submit the Flink job and start the event generator
+make flink-submit
+python -m generator.producer --mode fast
 
-# Run the pipeline
-make flink-submit                              # submit Flink job
-python -m generator.producer --mode fast       # flood Kafka for testing
-python -m generator.producer --mode realtime   # simulate live dark store
-
-# Train models (after features accumulate)
-python -m ml.train_detector
-python -m ml.train_forecast
-
-# Run drift detection
-python -m observability.drift_job
-
-# Business dashboard
-streamlit run serving/streamlit_app.py
+# 4. Train models (after ~5 min of feature accumulation)
+make export-features
+make train
+make forecast
 ```
 
 **Service URLs (local):**
-| Service | URL |
-|---|---|
-| Flink UI | http://localhost:8081 |
-| MLflow | http://localhost:5000 |
-| Dagster | http://localhost:3000 |
-| Grafana | http://localhost:3001 (admin / veloshelf) |
-| Streamlit | http://localhost:8501 |
-| Prometheus | http://localhost:9090 |
+
+| Service | URL | Credentials |
+|---|---|---|
+| Flink UI | http://localhost:8081 | — |
+| Kafka UI | http://localhost:8080 | — |
+| MLflow | http://localhost:5000 | — |
+| Dagster | http://localhost:3000 | — |
+| Grafana | http://localhost:3001 | admin / veloshelf |
+| Streamlit | http://localhost:8501 | — |
+| Prometheus | http://localhost:9090 | — |
 
 ---
 
-## AWS Deployment
+## AWS deployment
 
 ```bash
-# One-time: create state bucket + lock table
-aws s3 mb s3://veloshelf-tfstate-<suffix> --region ap-south-1
-aws dynamodb create-table \
-  --table-name veloshelf-tfstate-lock \
-  --attribute-definitions AttributeName=LockID,AttributeType=S \
-  --key-schema AttributeName=LockID,KeyType=HASH \
-  --billing-mode PAY_PER_REQUEST \
-  --region ap-south-1
+# One-time: create Terraform state bucket
+aws s3 mb s3://veloshelf-tfstate-<account-id> --region ap-south-1
 
-# Configure and deploy
+# Copy and fill variables
 cp infra/terraform.tfvars.example infra/terraform.tfvars
-# edit terraform.tfvars with your values
-cd infra && terraform init && terraform apply
+
+# Provision (~10 min — RDS is the slow part)
+make infra-up
+
+# SSH in and start the stack
+make ec2-ssh
 ```
 
-GitHub Actions deploys automatically on merge to `main` using OIDC (zero stored AWS credentials).
+**Cost controls:**
+
+```bash
+make ec2-stop    # pause EC2 when not demoing  (~$0.10/hr saved)
+make ec2-start   # resume before a demo
+make infra-down  # destroy everything when done
+```
+
+> Running cost: EC2 m7i-flex.large ~$73/mo + RDS db.t3.micro ~$12/mo.  
+> Stop EC2 between demos → pay only ~$12/mo idle.
 
 ---
-## Test coverage
+
+## GitHub Actions secrets
+
+To enable the CD pipeline (auto-deploy on push to `main`), add these in **Settings → Secrets → Actions**:
+
+| Secret | Value |
+|---|---|
+| `AWS_DEPLOY_ROLE_ARN` | ARN of the GitHub Actions IAM role (OIDC) |
+| `TF_STATE_BUCKET` | `veloshelf-tfstate-<account-id>` |
+| `TF_LOCK_TABLE` | `veloshelf-tfstate-lock` |
+| `S3_SUFFIX` | your AWS account ID |
+| `EC2_KEY_NAME` | `veloshelf-key` |
+| `EC2_SSH_PRIVATE_KEY` | contents of `veloshelf-key.pem` |
+| `DB_PASSWORD` | Postgres master password |
+
+---
+
+## Repository layout
 
 ```
-88 tests across 6 phases
-  Phase 0+1: schemas, seed validation, distributions, inventory, anomaly injector
-  Phase 2:   streaming validation, scoring, Parquet sink
-  Phase 3:   feature engineering, MAE/RMSE/MAPE, precision/recall/F1, promotion logic
-  Phase 4:   PSI, KS, JS divergence, rolling window split, Prometheus push helpers
-  Phase 5:   trigger decision, cooldown, multi-feature drift, partial cooldown
+veloshelf/
+├── generator/          # Synthetic event producer (Poisson, Zipf, anomaly injection)
+├── streaming/          # PyFlink job, online scorer, Postgres + dead-letter sinks
+├── ml/                 # Feature export, anomaly detector training, demand forecaster
+├── orchestration/      # Dagster assets, schedules, drift-retrain sensor
+├── observability/      # Evidently drift job, Prometheus metrics exporter, retrain trigger
+├── serving/
+│   └── grafana/        # Datasource + dashboard provisioning (auto-loaded on startup)
+├── infra/
+│   ├── main.tf         # Root Terraform module
+│   ├── variables.tf
+│   ├── modules/
+│   │   ├── networking/ # VPC, subnets, internet gateway
+│   │   ├── ec2/        # Instance, IAM role, security group
+│   │   ├── rds/        # Postgres, subnet group
+│   │   └── s3/         # Feature Parquet + MLflow artifact buckets
+│   └── init_db.sql     # Schema: windowed_features, alerts
+├── .github/workflows/
+│   ├── ci.yml          # Lint + test on every PR
+│   └── deploy.yml      # SSH deploy on push to main
+└── docker-compose.yml  # Full local stack (12 services)
 ```
