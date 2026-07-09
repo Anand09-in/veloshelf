@@ -76,26 +76,25 @@ def fetch_alert_counts() -> dict[str, int]:
         """
         SELECT alert_type, COUNT(*) AS cnt
         FROM alerts
-        WHERE triggered_at > NOW() - INTERVAL '%s minutes'
+        WHERE resolved = FALSE
         GROUP BY alert_type
-        """,
-        (ALERT_WINDOW_MIN,),
+        """
     )
     if df.empty:
         return {"stockout": 0, "surge": 0}
     counts = dict(zip(df["alert_type"], df["cnt"].astype(int)))
-    return {"stockout": counts.get("stockout", 0), "surge": counts.get("surge", 0)}
+    return {"stockout": counts.get("stockout_risk", 0), "surge": counts.get("surge", 0)}
 
 
 def fetch_stockout_risks(threshold: int) -> pd.DataFrame:
     return query(
         """
         SELECT store_id, sku_id,
-               on_hand_est, depletion_velocity, order_rate, demand_momentum,
+               on_hand_est, depletion_vel, order_rate, demand_momentum,
                window_end
         FROM windowed_features
         WHERE on_hand_est <= %s
-        ORDER BY depletion_velocity DESC
+        ORDER BY depletion_vel DESC
         LIMIT 50
         """,
         (threshold,),
@@ -105,7 +104,7 @@ def fetch_stockout_risks(threshold: int) -> pd.DataFrame:
 def fetch_surge_alerts() -> pd.DataFrame:
     return query(
         """
-        SELECT a.store_id, a.sku_id, a.severity, a.score,
+        SELECT a.store_id, a.sku_id, a.metric_value, a.threshold,
                a.triggered_at,
                f.order_rate, f.demand_momentum, f.on_hand_est
         FROM alerts a
@@ -117,11 +116,10 @@ def fetch_surge_alerts() -> pd.DataFrame:
             LIMIT 1
         ) f ON true
         WHERE a.alert_type = 'surge'
-          AND a.triggered_at > NOW() - INTERVAL '%s minutes'
-        ORDER BY a.score DESC
+          AND a.resolved = FALSE
+        ORDER BY a.metric_value DESC
         LIMIT 30
-        """,
-        (ALERT_WINDOW_MIN,),
+        """
     )
 
 
@@ -130,8 +128,8 @@ def fetch_category_velocity() -> pd.DataFrame:
     return query(
         """
         SELECT store_id, sku_id,
-               ROUND(AVG(order_rate)::numeric, 3)       AS avg_order_rate,
-               ROUND(AVG(depletion_velocity)::numeric, 3) AS avg_depletion
+               ROUND(AVG(order_rate)::numeric, 3)     AS avg_order_rate,
+               ROUND(AVG(depletion_vel)::numeric, 3)  AS avg_depletion
         FROM windowed_features
         WHERE window_end > NOW() - INTERVAL '10 minutes'
         GROUP BY store_id, sku_id
@@ -169,13 +167,12 @@ def fetch_store_health() -> pd.DataFrame:
 def fetch_recent_alerts_log() -> pd.DataFrame:
     return query(
         """
-        SELECT alert_type, store_id, sku_id, severity, score, triggered_at
+        SELECT alert_type, store_id, sku_id, metric_value, threshold,
+               resolved, triggered_at
         FROM alerts
-        WHERE triggered_at > NOW() - INTERVAL '%s minutes'
         ORDER BY triggered_at DESC
         LIMIT 100
-        """,
-        (ALERT_WINDOW_MIN,),
+        """
     )
 
 
@@ -275,7 +272,7 @@ def render_stockout(threshold: int) -> None:
 
     display = df.rename(columns={
         "store_id": "Store", "sku_id": "SKU",
-        "on_hand_est": "On Hand", "depletion_velocity": "Depletion (u/min)",
+        "on_hand_est": "On Hand", "depletion_vel": "Depletion (u/min)",
         "order_rate": "Order Rate", "demand_momentum": "Momentum",
         "window_end": "Window End",
     })
@@ -294,32 +291,23 @@ def render_surges() -> None:
         st.info(f"No surge alerts in the last {ALERT_WINDOW_MIN} minutes.")
         return
 
-    st.caption(f"{len(df)} active surge(s) · sorted by score")
+    st.caption(f"{len(df)} active surge(s) · sorted by metric value")
 
-    # Score bar chart
-    if not df.empty and "score" in df.columns:
-        chart_df = df[["sku_id", "store_id", "score"]].head(15).copy()
-        chart_df["label"] = chart_df["sku_id"] + " / " + chart_df["store_id"]
-        st.bar_chart(
-            chart_df.set_index("label")["score"],
-            height=200,
-            color="#f4a261",
-        )
-
-    # Severity icon column
-    if "severity" in df.columns:
-        df["sev"] = df["severity"].map(SEVERITY_COLOUR).fillna("⚪")
-        cols = ["sev", "store_id", "sku_id", "score", "order_rate",
-                "demand_momentum", "on_hand_est", "triggered_at"]
-        cols = [c for c in cols if c in df.columns]
-        df = df[cols]
+    # metric_value bar chart
+    chart_df = df[["sku_id", "store_id", "metric_value"]].head(15).copy()
+    chart_df["label"] = chart_df["sku_id"] + " / " + chart_df["store_id"]
+    st.bar_chart(
+        chart_df.set_index("label")["metric_value"],
+        height=200,
+        color="#f4a261",
+    )
 
     st.dataframe(
         df.rename(columns={
-            "sev": "", "store_id": "Store", "sku_id": "SKU",
-            "score": "Score", "order_rate": "Order Rate",
-            "demand_momentum": "Momentum", "on_hand_est": "On Hand",
-            "triggered_at": "Triggered At",
+            "store_id": "Store", "sku_id": "SKU",
+            "metric_value": "Momentum", "threshold": "Threshold",
+            "order_rate": "Order Rate", "demand_momentum": "Demand Momentum",
+            "on_hand_est": "On Hand", "triggered_at": "Triggered At",
         }),
         use_container_width=True,
         hide_index=True,
@@ -386,13 +374,13 @@ def render_store_health() -> None:
     # Recent alert log
     log = fetch_recent_alerts_log()
     if not log.empty:
-        with st.expander(f"Alert log — last {ALERT_WINDOW_MIN} min ({len(log)} events)"):
-            log["sev"] = log["severity"].map(SEVERITY_COLOUR).fillna("⚪")
+        with st.expander(f"Alert log — last {len(log)} events"):
             st.dataframe(
-                log[["sev", "alert_type", "store_id", "sku_id", "score", "triggered_at"]].rename(
-                    columns={"sev": "", "alert_type": "Type", "store_id": "Store",
-                             "sku_id": "SKU", "score": "Score", "triggered_at": "Time"}
-                ),
+                log.rename(columns={
+                    "alert_type": "Type", "store_id": "Store", "sku_id": "SKU",
+                    "metric_value": "Value", "threshold": "Threshold",
+                    "resolved": "Resolved", "triggered_at": "Time",
+                }),
                 use_container_width=True,
                 hide_index=True,
             )
