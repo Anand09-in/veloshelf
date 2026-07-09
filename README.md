@@ -50,11 +50,37 @@ flowchart LR
 
 ---
 
-## Grafana Dashboard
+## Screenshots
 
-![VeloShelf Pipeline Health Dashboard](docs/grafana_dashboard.png)
+### Dagster — Asset Graph
+![Dagster asset graph](docs/dagster_assets.png)
 
-*Four sections: Pipeline Health (freshness lag, drift status, active alerts, max PSI) · Drift Metrics (PSI / KS / JS per feature over time) · Pipeline Activity (freshness lag + alert counts) · Model Performance (Forecaster MAE, Detector F1)*
+*Five assets wired as a DAG: windowed features → detector + forecaster training → promotion. Drift sensor auto-triggers retraining when PSI > 0.25.*
+
+### Flink — Running Job
+![Flink running job](docs/flink_job.png)
+
+*PyFlink 1.18 streaming job: event-time tumbling windows, watermarks, dead-letter quarantine. Shows live throughput and back-pressure metrics.*
+
+### Streamlit — Business Dashboard
+![Streamlit business dashboard](docs/streamlit_dashboard.png)
+
+*Five-tab business view for supply-chain ops: stockout risk sorted by depletion velocity, active surge alerts, SKU velocity by store, store health summary, and Evidently drift reports.*
+
+### MLflow — Model Registry
+![MLflow model registry](docs/mlflow_registry.png)
+
+*Two registered models (Isolation Forest anomaly detector + XGBoost demand forecaster) with Production alias. Hot-swap loader polls every 5 min — no Flink restart needed.*
+
+### Kafka UI — Live Topics
+![Kafka UI topics](docs/kafka_topics.png)
+
+*Five topics: raw-orders, raw-inventory (generator → Flink), stockout-alerts, surge-alerts (Flink → consumers), dead-letter (quarantined invalid events).*
+
+### Grafana — Pipeline Health
+![Grafana pipeline health dashboard](docs/grafana_dashboard.png)
+
+*Four sections: Pipeline Health (freshness lag, drift status, active alerts, max PSI) · Drift Metrics (PSI / KS / JS per feature over time) · Pipeline Activity · Model Performance (MAE, F1).*
 
 ---
 
