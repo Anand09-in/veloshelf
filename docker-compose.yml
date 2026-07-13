@@ -1,9 +1,16 @@
 # VeloShelf local stack (Phase 4).
 # Kafka (KRaft) + Postgres + MLflow + Dagster + Flink + Prometheus + Grafana + Streamlit.
 
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+
 services:
   kafka:
     image: apache/kafka:3.8.0
+    logging: *default-logging
     ports:
       - "9092:9092"    # host access
       - "29092:29092"  # docker-internal access
@@ -29,6 +36,7 @@ services:
 
   redis:
     image: redis:7-alpine
+    logging: *default-logging
     ports:
       - "6379:6379"
     healthcheck:
@@ -39,6 +47,7 @@ services:
 
   postgres:
     image: postgres:16-alpine
+    logging: *default-logging
     ports:
       - "5432:5432"
     environment:
@@ -55,6 +64,7 @@ services:
 
   mlflow:
     image: ghcr.io/mlflow/mlflow:v3.1.0
+    logging: *default-logging
     ports:
       - "5000:5000"
     command: >
@@ -68,6 +78,7 @@ services:
 
   dagster:
     image: python:3.11-slim
+    logging: *default-logging
     ports:
       - "3000:3000"
     working_dir: /app
@@ -87,6 +98,7 @@ services:
 
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
+    logging: *default-logging
     ports:
       - "8080:8080"
     environment:
@@ -102,6 +114,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.flink
+    logging: *default-logging
     ports:
       - "8081:8081"
     command: jobmanager
@@ -123,6 +136,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.flink
+    logging: *default-logging
     command: taskmanager
     environment:
       - "FLINK_PROPERTIES=jobmanager.rpc.address: flink-jobmanager"
@@ -140,6 +154,7 @@ services:
   # -------------------------------------------------------------------
   prometheus:
     image: prom/prometheus:v2.50.1
+    logging: *default-logging
     ports:
       - "9090:9090"
     volumes:
@@ -159,6 +174,7 @@ services:
 
   grafana:
     image: grafana/grafana:10.3.3
+    logging: *default-logging
     ports:
       - "3001:3000"
     environment:
@@ -174,6 +190,7 @@ services:
 
   metrics-exporter:
     image: python:3.11-slim
+    logging: *default-logging
     ports:
       - "8000:8000"
     working_dir: /app
@@ -192,6 +209,7 @@ services:
 
   streamlit:
     image: python:3.11-slim
+    logging: *default-logging
     ports:
       - "8501:8501"
     working_dir: /app
